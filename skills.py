@@ -1,5 +1,7 @@
 import json
 from urllib.request import Request, urlopen
+from collections import deque
+from time import perf_counter
 
 class PhotoSkill:
     """普通单张拍照技能。"""
@@ -54,6 +56,11 @@ class NpcTalkSkill:
     ):
         self.model = model
         self.url = url
+        self.history = deque(maxlen=6)
+
+    def clear_history(self):
+        """清空当前 NPC 的短期对话记忆。"""
+        self.history.clear()
 
     def execute(self, user_text):
         system_prompt = (
@@ -70,18 +77,15 @@ class NpcTalkSkill:
             "机械臂等实际操作。"
         )
 
+        messages = [
+            {"role": "system", "content": system_prompt},
+            *self.history,
+            {"role": "user", "content": user_text}
+        ]
+
         payload = {
             "model": self.model,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": system_prompt
-                },
-                {
-                    "role": "user",
-                    "content": user_text
-                }
-            ],
+            "messages": messages,
             "stream": False,
             "think": False,
             "keep_alive": "30s",
@@ -93,6 +97,7 @@ class NpcTalkSkill:
         }
 
         try:
+            started = perf_counter()
             request = Request(
                 self.url,
                 data=json.dumps(
@@ -127,6 +132,21 @@ class NpcTalkSkill:
                 "success": False,
                 "message": "NPC 没有生成有效回复"
             }
+
+        print(
+            f"[NpcTalkSkill] 对话生成耗时: "
+            f"{perf_counter() - started:.2f}s"
+        )
+
+        self.history.append({
+            "role": "user",
+            "content": user_text[:200]
+        })
+
+        self.history.append({
+            "role": "assistant",
+            "content": reply[:160]
+        })
 
         return {
             "success": True,

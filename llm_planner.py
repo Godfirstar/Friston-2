@@ -44,11 +44,6 @@ class LLMPlanner:
                             "type": "integer",
                             "minimum": 1,
                             "maximum": 10
-                        },
-                        "reply": {
-                            "type": "string",
-                            "minLength": 1,
-                            "maxLength": 120
                         }
                     },
                     "additionalProperties": False
@@ -98,7 +93,7 @@ class LLMPlanner:
             "options": {
                 "temperature": 0.2,
                 "num_ctx": 2048,
-                "num_predict": 256
+                "num_predict": 96
             }
         }
 

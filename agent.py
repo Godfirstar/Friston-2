@@ -18,6 +18,11 @@ class Agent:
                 "message": "暂不支持这条指令"
             }
 
+        if call["skill"] == "npc_talk":
+            call["arguments"] = {
+                "user_text": instruction
+            }
+
         print(f"[Agent] 工具调用: {call}")
 
         # 2. 由 Skill Manager 验证并执行

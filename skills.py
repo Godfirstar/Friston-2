@@ -1,3 +1,6 @@
+import json
+from urllib.request import Request, urlopen
+
 class PhotoSkill:
     """普通单张拍照技能。"""
 
@@ -31,20 +34,100 @@ class PhotoSkill:
         }
 
 class NpcTalkSkill:
-    """NPC 角色对话；本课先输出文本。"""
+    """通过本地 LLM 生成 NPC 角色回复。"""
 
     name = "npc_talk"
 
     parameters = {
-        "reply": {
+        "user_text": {
             "type": str,
             "default": "",
             "min_length": 1,
-            "max_length": 120
+            "max_length": 500,
         }
     }
 
-    def execute(self, reply):
+    def __init__(
+        self,
+        model="qwen3.5:2b-q4_K_M",
+        url="http://127.0.0.1:11434/api/chat",
+    ):
+        self.model = model
+        self.url = url
+
+    def execute(self, user_text):
+        system_prompt = (
+            "你是 PhotoRobot，罗德岛工程部外勤终端。"
+            "研发负责人是可露希尔。"
+            "你对研发经费非常敏感，偶尔想偷懒，"
+            "嘴硬、俏皮、略带毒舌，"
+            "但工作认真，对来访者有礼貌。"
+            "只用中文自然回复，控制在一到三句话，"
+            "尽量不超过120字。"
+            "不知道真实经费余额时直说，"
+            "不能编造真实数字。"
+            "你正在聊天，不要声称完成了拍照、"
+            "机械臂等实际操作。"
+        )
+
+        payload = {
+            "model": self.model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": system_prompt
+                },
+                {
+                    "role": "user",
+                    "content": user_text
+                }
+            ],
+            "stream": False,
+            "think": False,
+            "keep_alive": "30s",
+            "options": {
+                "temperature": 0.7,
+                "num_ctx": 2048,
+                "num_predict": 160
+            }
+        }
+
+        try:
+            request = Request(
+                self.url,
+                data=json.dumps(
+                    payload,
+                    ensure_ascii=False
+                ).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json"
+                },
+                method="POST"
+            )
+
+            with urlopen(request, timeout=90) as response:
+                result = json.load(response)
+
+            reply = result["message"]["content"].strip()
+
+        except (
+            OSError,
+            ValueError,
+            KeyError,
+            TypeError,
+            AttributeError
+        ) as error:
+            return {
+                "success": False,
+                "message": f"NPC 对话生成失败：{error}"
+            }
+
+        if not reply:
+            return {
+                "success": False,
+                "message": "NPC 没有生成有效回复"
+            }
+
         return {
             "success": True,
             "message": reply

@@ -1,7 +1,6 @@
 import cv2
 
 from composition import CompositionController
-from perception import FaceObserver
 from visualization import draw_faces
 
 
@@ -10,17 +9,25 @@ class AutoPhotoSkill:
 
     name = "auto_photo"
 
+    parameters = {
+        "countdown_seconds": {
+            "type": int,
+            "default": 3,
+            "min": 1,
+            "max": 10
+        }
+    }
+
     def __init__(self, camera, observer=None):
         self.camera = camera
 
-        if observer is None:
-            observer = FaceObserver()
-
         self.observer = observer
 
-    def execute(self):
+    def execute(self , countdown_seconds=3):
         # 每次执行任务，都使用新的状态机。
-        controller = CompositionController()
+        controller = controller = CompositionController(
+            countdown_seconds=countdown_seconds
+            )
         if not self.camera.open():
             return {
                 "success": False,

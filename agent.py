@@ -1,25 +1,27 @@
-class Agent:
-    """根据用户指令选择已注册的技能。"""
 
-    def __init__(self, skill_manager):
+class Agent:
+    """通过 Planner 生成技能调用，再交由管理器执行。"""
+
+    def __init__(self, skill_manager, planner):
         self.skill_manager = skill_manager
+        self.planner = planner
 
     def handle(self, instruction):
-        instruction = instruction.strip()
-        print(f"[Agent] 收到命令: {instruction}")
+        print(f"[Agent] 收到指令: {instruction}")
 
-        # 先匹配自动拍照，避免被普通拍照关键词提前截获。
-        auto_photo_keywords = ("自动拍照", "自动摄影")
-        if any(keyword in instruction for keyword in auto_photo_keywords):
-            print("[Agent] 识别意图: auto_photo")
-            return self.skill_manager.execute("auto_photo")
+        # 1. 生成结构化工具调用
+        call = self.planner.plan(instruction)
 
-        photo_keywords = ("拍照", "拍张照", "拍一张", "合影", "自拍", "照相")
-        if any(keyword in instruction for keyword in photo_keywords):
-            print("[Agent] 识别意图: take_photo")
-            return self.skill_manager.execute("take_photo")
+        if call is None:
+            return {
+                "success": False,
+                "message": "暂不支持这条指令"
+            }
 
-        return {
-            "success": False,
-            "message": "暂时无法理解这条指令",
-        }
+        print(f"[Agent] 工具调用: {call}")
+
+        # 2. 由 Skill Manager 验证并执行
+        return self.skill_manager.execute(
+            call["skill"],
+            call["arguments"]
+        )

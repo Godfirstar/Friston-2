@@ -1,15 +1,17 @@
 from agent import Agent
 from auto_photo import AutoPhotoSkill
 from devices import RealCamera
-from skills import PhotoSkill, SkillManager
+from skills import PhotoSkill, SkillManager, NpcTalkSkill
 from yunet_observer import YuNetObserver
+from llm_planner import LLMPlanner
+
 
 
 CAMERA_INDEX = 0
 
 
 def main():
-    print("PhotoRobot v0.5 启动（真实摄像头模式）")
+    print("PhotoRobot v0.7 启动（真实摄像头模式）")
     camera = RealCamera(index=CAMERA_INDEX)
     manager = SkillManager()
 
@@ -21,11 +23,18 @@ def main():
             observer=YuNetObserver()
         )
     )
-    agent = Agent(manager)
+
+    manager.register(NpcTalkSkill())
+
+    agent = Agent(
+        manager,
+        LLMPlanner(manager)
+    )
 
     print("可用指令：")
     print("  帮我拍张照：普通拍照")
     print("  自动拍照：实时人脸检测、构图判断与倒计时拍照")
+    print("  自动拍照，倒计时5秒：自定义倒计时")
     print("  退出：结束程序")
 
     while True:

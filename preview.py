@@ -1,11 +1,10 @@
 import cv2
 
-from devices import RealCamera
-from yunet_observer import YuNetObserver
-from visualization import draw_faces
+from friston2.hardware.camera import RealCamera
+from friston2.vision.yunet_observer import YuNetObserver
+from friston2.vision.visualization import draw_faces
 
-
-CAMERA_INDEX = 0
+from friston2.config import CAMERA_INDEX
 
 
 def main():
@@ -16,7 +15,7 @@ def main():
         print(f"无法打开摄像头（设备索引：{CAMERA_INDEX}）")
         return
 
-    print("PhotoRobot v0.5 视觉预览")
+    print("Friston-2 视觉预览")
     print("Q: 退出 | S: 拍照 | O: 输出观测")
 
     try:
@@ -47,7 +46,7 @@ def main():
                 (255, 255, 255),
                 2,
             )
-            cv2.imshow("PhotoRobot Preview", display)
+            cv2.imshow("Friston-2 Preview", display)
 
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):

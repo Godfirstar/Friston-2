@@ -1,17 +1,17 @@
-from agent import Agent
-from auto_photo import AutoPhotoSkill
-from devices import RealCamera
-from skills import PhotoSkill, SkillManager, NpcTalkSkill
-from yunet_observer import YuNetObserver
-from llm_planner import LLMPlanner
+from friston2.agent import Agent
+from friston2.skills.auto_photo import AutoPhotoSkill
+from friston2.hardware.camera import RealCamera
+from friston2.skills.photo import PhotoSkill
+from friston2.skills.manager import SkillManager
+from friston2.skills.npc import NpcTalkSkill
+from friston2.vision.yunet_observer import YuNetObserver
+from friston2.planner import LLMPlanner
+from friston2.config import CAMERA_INDEX
 
-
-
-CAMERA_INDEX = 0
 
 
 def main():
-    print("PhotoRobot v0.7 启动（真实摄像头模式）")
+    print("Friston-2 启动（真实摄像头模式）")
     camera = RealCamera(index=CAMERA_INDEX)
     manager = SkillManager()
 
@@ -43,7 +43,7 @@ def main():
         try:
             instruction = input("\n你: ").strip()
         except (EOFError, KeyboardInterrupt):
-            print("\nPhotoRobot 已退出。")
+            print("\nFriston-2 已退出。")
             break
 
         if instruction.lower() in ("退出", "exit", "quit"):
@@ -51,13 +51,13 @@ def main():
         if instruction in ("清空记忆", "/clear"):
             npc.clear_history()
 
-            print("PhotoRobot: 本次会话的短期记忆已清空。")
+            print("Friston-2: 本次会话的短期记忆已清空。")
             continue
         if not instruction:
             continue
 
         result = agent.handle(instruction)
-        print("PhotoRobot:", result.get("message", "任务结束"))
+        print("Friston-2:", result.get("message", "任务结束"))
 
 
 if __name__ == "__main__":

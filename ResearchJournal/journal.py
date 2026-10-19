@@ -28,7 +28,8 @@ import time
 import traceback
 import zipfile
 
-from note_format import source_comparison, polish_markdown
+from note_format import source_comparison, polish_markdown, insert_comparison
+from code_history import archive_snapshot, find_snapshot, version_ids, referenced_source_paths, latest_only_excerpt
 from knowledge_maintenance import (
     card_destination, is_dismissed_version, is_ignored_concept, is_locked, manage,
 )
@@ -573,9 +574,8 @@ def write_note(result, new_sig, old_sig, stats, picked, pending=False, path=None
     appendix += "\n\n## 对应的 GPT 对话\n\n" + (chatrefs or "未导入可匹配的聊天记录；仅参考本地项目决策摘要。")
     appendix += "\n\n## 本次生成信息\n\n"
     appendix += f"- 模型：**{model}**（{model_source}）\n- Codex：{cli}\n- 状态：{tag}\n"
-    body = front + result['markdown'].strip() + '\n\n' + note
-    if code_excerpt:
-        body += '---\n\n' + code_excerpt + '\n'
+    content = insert_comparison(result['markdown'].strip(), code_excerpt)
+    body = front + content + '\n\n' + note
     path.write_text(body + appendix + "\n", encoding="utf-8")
     return path
 
@@ -656,6 +656,10 @@ def produce(old, files, config):
     changes = changed_files(old_files, files)
     if not changes:
         return False
+    # Preserve both real source versions before the baseline is overwritten.
+    # These snapshots remain strictly inside ResearchJournal/state/.
+    archive_snapshot(STATE, old_files, before)
+    archive_snapshot(STATE, files, after)
     diff, stats = diff_text(old_files, files, changes, int(config.get("max_diff_characters", 90000)))
     excerpt = redact(source_comparison(old_files, files, changes,
                                 max_files=max(1, int(config.get('code_compare_max_files', 3))),
@@ -781,6 +785,7 @@ def watch(config):
                 current_sig = signature(current)
                 old = read_baseline()
                 if old is None:
+                    archive_snapshot(STATE, current, current_sig)
                     save_baseline(current, current_sig)
                     update_index()
                     log(f"Initial baseline established: {current_sig[:12]}, {len(current)} source files")
@@ -806,6 +811,64 @@ def watch(config):
         except OSError:
             pass
         guard.close()
+
+
+def historical_excerpt(note_text, config):
+    """Only real snapshots matching frontmatter may be quoted as past code."""
+    previous, current = version_ids(note_text)
+    if not current:
+        return '', '版本笔记缺少 source_after，无法验证对应源码'
+    after = find_snapshot(STATE, current)
+    if after is None:
+        return '', '与此版本对应的源码快照已不可用；不能补造代码'
+    old = find_snapshot(STATE, previous) if previous else None
+    files = after['files']
+    max_files = max(1, int(config.get('code_compare_max_files', 3)))
+    max_hunks = max(1, int(config.get('code_compare_hunks_per_file', 2)))
+    max_lines = max(10, int(config.get('code_compare_lines_per_snippet', 25)))
+    if old is not None:
+        paths = changed_files(old['files'], files)
+        comparison = source_comparison(old['files'], files, paths,
+                                      max_files=max_files,
+                                      max_hunks_per_file=max_hunks,
+                                      max_lines=max_lines)
+        return redact(comparison), '已找到对应的前后真实快照'
+    paths = referenced_source_paths(note_text, files)
+    excerpt = latest_only_excerpt(files, paths, max_files=max_files,
+                                  max_blocks=min(2, max_hunks), max_lines=max_lines)
+    return redact(excerpt), '仅找到本版真实源码，缺少旧版快照'
+
+
+def backfill_code(label, config):
+    """Append one safe code appendix to a version note, saving an original backup."""
+    from knowledge_maintenance import resolve_file
+    note_path = resolve_file(VERSIONS, label)
+    original = note_path.read_text(encoding='utf-8')
+    marker = '<!-- RJ:SOURCE-CODE:BACKFILL:START -->'
+    if marker in original or '## 修改前后源码（真实快照' in original:
+        return '该版本记录已有本工具生成的代码补充，无需重复写入。'
+    if is_locked(original):
+        return '笔记已设置 maintenance: locked；拒绝自动修改，请先自行解锁。'
+    content, availability = historical_excerpt(original, config)
+    if not content:
+        return f'未修改笔记：{availability}。可以尝试提供历史版本源码或 Git 提交。'
+    stamp = now_local().strftime('%Y%m%d-%H%M%S')
+    backups = STATE / 'note-backups'
+    backups.mkdir(parents=True, exist_ok=True)
+    backup = backups / f'{note_path.stem}-{stamp}.md'
+    if backup.exists():
+        raise FileExistsError(f'为避免备份冲突，停止操作：{backup}')
+    # Never rewrite previous note text, not even a character. One bounded
+    # appended block, with a full backup for user-led rollback if necessary.
+    backup.write_text(original, encoding='utf-8')
+    appendix = ('\n\n---\n\n' + marker + '\n\n'
+                + content + '\n\n'
+                + f'> 来源状态：{availability}。本节由本地程序自动摘录，不代表已运行验收。\n\n'
+                + '<!-- RJ:SOURCE-CODE:BACKFILL:END -->\n')
+    with note_path.open('a', encoding='utf-8') as handle:
+        handle.write(appendix)
+    log(f'Code backfilled to {note_path.name}; source={availability}; backup={backup.name}')
+    return f'已补充真实源码：{note_path.name}；{availability}。原始文件备份：{backup}'
 
 
 def revise_existing_note(label, config):
@@ -839,19 +902,30 @@ JSON importance=meaningful，concepts=[]（这是已有笔记重排，不需要�
               f'> [!warning] 这是重排建议稿，不是已经替换的版本记录。\n'
               f'> 原文件 `[[01-版本记录/{origin.stem}]]` 保持不变。\n'
               '> 未提供完整的历史源码，不能在这份建议稿中补造真实的旧版代码。\n\n')
-    dest.write_text(header + result['markdown'].strip() + '\n', encoding='utf-8')
+    excerpt, _availability = historical_excerpt(original, config)
+    dest.write_text(header + insert_comparison(result['markdown'].strip(), excerpt) + '\n', encoding='utf-8')
     log(f'Revision draft prepared: {dest.name}')
     return dest
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Friston-2 自动研发日志 Agent v3")
-    parser.add_argument("command", choices=["watch", "once", "status", "import", "manage", "revise"])
+    parser = argparse.ArgumentParser(description="Friston-2 自动研发日志 Agent v3.1")
+    parser.add_argument("command", choices=["watch", "once", "status", "import", "manage", "revise", "backfill-code"])
     parser.add_argument('action', nargs='?', help='manage: dismiss-card/dismiss-version/lock-card/unlock-card/lock-version/unlock-version/ignore-topic/unignore-topic')
     parser.add_argument('label', nargs='?', help='笔记文件名或技术主题')
     args = parser.parse_args()
     make_dirs()
     cfg = load_config()
+    # v2/v3 stored only the latest baseline. Archive it on upgrading so its
+    # exact source can still be referenced after future edits.
+    existing_baseline = read_baseline()
+    if existing_baseline is not None:
+        archive_snapshot(STATE, existing_baseline['files'], existing_baseline['signature'])
+    if args.command == "backfill-code":
+        if not args.action:
+            parser.error('backfill-code requires a version note filename')
+        print(backfill_code(args.action, cfg))
+        return 0
     if args.command == "manage":
         if not args.action or not args.label:
             parser.error('manage 需要操作名和笔记文件名/主题；运行 python journal.py --help 查看')
@@ -885,7 +959,9 @@ def main():
         return 0
     import_inbox(cfg)
     if old is None:
-        save_baseline(current, signature(current))
+        initial_sig = signature(current)
+        archive_snapshot(STATE, current, initial_sig)
+        save_baseline(current, initial_sig)
         update_index()
         print("已建立首次本地基线。之后会自动记录新改动。")
     else:

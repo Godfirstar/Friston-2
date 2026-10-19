@@ -1,0 +1,28 @@
+# Python and local environment
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+.vscode/
+.idea/
+
+# Generated data, photos, models (avoid committing private images and large weights)
+*.db
+*.db-*
+*.sqlite*
+photos/*
+!photos/.gitkeep
+models/*
+!models/.gitkeep
+data/runtime/*
+!data/runtime/.gitkeep
+*.onnx
+*.gguf
+*.pt
+*.pth
+data/external/
+data/retired_lore/
+
+# OS files
+Thumbs.db
+.DS_Store

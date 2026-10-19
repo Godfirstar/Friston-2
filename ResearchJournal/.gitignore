@@ -1,0 +1,5 @@
+# The vault may contain private ChatGPT conversations and internal source diffs.
+# Keep local data out of remote Git even if the main repo uses Git.
+state/
+inbox/
+vault/03-GPT对话/

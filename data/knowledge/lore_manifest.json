@@ -1,0 +1,46 @@
+{
+  "entities": 3199,
+  "aliases": 4084,
+  "sources": 1391,
+  "passages": 31988,
+  "relations": 7242,
+  "event_mentions": 23028,
+  "import_issues": 31,
+  "by_kind": {
+    "character": 910,
+    "event": 480,
+    "reference": 1809
+  },
+  "relations_by_status": {
+    "source_asserted": 6881,
+    "uncertain": 361
+  },
+  "issues_by_reason": {
+    "ambiguous_alias_group": 7,
+    "ambiguous_self_reference": 5,
+    "empty_profile": 6,
+    "invalid_page": 3,
+    "superseded_duplicate": 5,
+    "unparsed_relation": 5
+  },
+  "import_stats": {
+    "repository": "https://github.com/littlepangding/arknights_lore_wiki",
+    "revision": "90792060a13ae653817aebeb404d2506178d1fda",
+    "working_tree_modified": false,
+    "source_type": "llm_summary",
+    "excluded_prompt_files": 906,
+    "character_files_seen": 918,
+    "duplicate_pages": 5,
+    "invalid_pages": 3,
+    "characters": 910,
+    "events": 480,
+    "alias_collisions": 98,
+    "entities": 3199,
+    "aliases": 4084,
+    "sources": 1391,
+    "passages": 31988,
+    "relations": 7242,
+    "event_mentions": 23028,
+    "import_issues": 31
+  }
+}

@@ -1,5 +1,7 @@
 import json
+import os
 from urllib.request import Request, urlopen
+from time import perf_counter
 
 from friston2.config import OLLAMA_MODEL, OLLAMA_CHAT_URL
 
@@ -91,10 +93,12 @@ class LLMPlanner:
             "format": schema,
             "stream": False,
             "think": False,
-            "keep_alive": "30s",
+            "keep_alive": os.getenv("FRISTON_OLLAMA_KEEP_ALIVE", "30s"),
             "options": {
                 "temperature": 0.2,
-                "num_ctx": 2048,
+                # Match the NPC request size when both share one model.
+                "num_ctx": 4096 if self.model == os.getenv(
+                    "FRISTON_CHAT_MODEL", "qwen2.5:14b") else 2048,
                 "num_predict": 96
             }
         }
@@ -109,8 +113,20 @@ class LLMPlanner:
                 method="POST"
             )
 
+            start = perf_counter()
             with urlopen(request, timeout=90) as response:
                 result = json.load(response)
+            elapsed = perf_counter() - start
+            def seconds(key):
+                ns = result.get(key)
+                return round(ns / 1e9, 3) if isinstance(ns, (int, float)) else None
+            print('[LLMPlanner] 性能：', {
+                'wall_s': round(elapsed, 3), 'load_s': seconds('load_duration'),
+                'prompt_s': seconds('prompt_eval_duration'),
+                'decode_s': seconds('eval_duration'),
+                'prompt_tokens': result.get('prompt_eval_count'),
+                'output_tokens': result.get('eval_count'),
+            })
 
             raw = result["message"]["content"]
 

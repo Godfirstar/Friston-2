@@ -25,6 +25,17 @@ def conversation_act(text):
         return 'greeting'
     if re.fullmatch(r'(?:谢谢(?:你|您|啦|了)?|多谢(?:你|您)?|感谢你|辛苦了|thankyou|thanks)(?:啊|呀|哦|呢)?', q):
         return 'thanks'
+    # Match a complete personal report, not an emotion word anywhere in a
+    # short sentence. A named character's feelings remain a lore question.
+    time = r'今天|最近|现在|刚刚|这几天|这会儿|此刻'
+    personal = r'(?:(?:我(?:' + time + r')?|(?:' + time + r')(?:我)?))?'
+    degree = r'(?:(?:真的|实在|感觉|觉得|有点|有些|有一点|有点儿|好|很|挺|太|特别|非常))*'
+    feeling = r'(?:累|困|疲惫|疲倦|难过|孤独|害怕|失落|伤心|焦虑|烦躁|不开心|开心|高兴|不好|糟糕|很差)'
+    support = (r'(?:(?:只)?想(?:休息|歇|睡)(?:一下|一会儿?|会儿?)?(?:了)?|'
+               r'(?:能|可以)?(?:陪我|和我)(?:聊聊|聊一会儿?|说说话)(?:吗|吧)?)?')
+    if len(q) <= 65 and re.fullmatch(
+            personal + r'(?:心情)?' + degree + feeling + r'(?:了|的|呢|啊|呀|唉|嘛)*' + support, q):
+        return 'emotion'
     # Keep explicit information requests out of social-only routing.
     if re.search(r'什么|为什么|怎么|如何|是谁|哪(?:个|位|里)|介绍|解释|知道|认识|[?？]', raw):
         return 'general'
@@ -32,9 +43,6 @@ def conversation_act(text):
             and re.search(r'不错|很好|很棒|真棒|真厉害|真好|做得好|很厉害|漂亮|喜欢你|夸你|很有帮助', q)
             and not re.search(r'不(?:错才怪|太|怎么|喜欢)|一点也不|并不|谈不上', q)):
         return 'compliment'
-    if (len(q) <= 65 and re.search(r'难过|累了|好累|很累|有点累|疲惫|疲倦|孤独|害怕|失落|伤心|心情(?:很差|不好|糟)|不开心|很开心|很高兴', q)
-            and (re.search(r'我|今天|最近|现在|好累|累了', q) or len(q) <= 8)):
-        return 'emotion'
     return 'general'
 
 

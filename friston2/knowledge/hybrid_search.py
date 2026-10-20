@@ -15,7 +15,9 @@ from pathlib import Path
 
 from friston2.knowledge.entity_resolver import resolve_entity_resolution
 from friston2.knowledge.lore_text import normalize, tokenize
-from friston2.knowledge.retrieve_lore import detect_intent, ranked_search, _concept_definition
+from friston2.knowledge.retrieve_lore import (
+    detect_intent, ranked_search, _subject_names, _mentioned_subjects, _PERSON_KINDS,
+)
 from friston2.knowledge.semantic_index import search as semantic_search
 from friston2.knowledge.terra_kb import connect
 from friston2.npc.identity import IDENTITY
@@ -26,8 +28,14 @@ DENSE_CANDIDATES = 80
 MAX_FROM_ONE_FILE = 2
 
 
-def _diversified(rows, limit):
+def _diversified(rows, limit, ids=()):
     """Prioritize different documents, then backfill if the corpus is narrow."""
+    rows = list(rows)
+    if len(ids) >= 2:
+        reserved = [next((row for row in rows if row['ref_id'] == entity_id), None) for entity_id in ids]
+        reserved = [row for row in reserved if row is not None]
+        reserved_ids = {row['id'] for row in reserved}
+        rows = reserved + [row for row in rows if row['id'] not in reserved_ids]
     selected, deferred, seen, per_file = [], [], set(), Counter()
     for row in rows:
         content_key = normalize(row['content'])
@@ -51,7 +59,7 @@ def hybrid_ranked_search(db, question, *, ids=(), limit=8, kinds=None):
     """Fuse the existing safe lexical ranking with optional embedding hits.
 
     `ids` MUST be the entity resolver's explicit output, including [] for no
-    known person. Relationship queries stay on the original graph-first path.
+    known person. Semantic similarity retrieves context, never creates an edge.
     """
     ids = list(dict.fromkeys(ids))
     limit = max(1, min(30, int(limit)))
@@ -61,13 +69,15 @@ def hybrid_ranked_search(db, question, *, ids=(), limit=8, kinds=None):
     print(f"[HybridRAG] intent={intent}, entities={ids}")
 
     # A known person's introduction already has a high-confidence owner card.
-    # Relationship/leadership questions must not infer edges from semantic similarity.
-    skip_dense = (intent in ('relationship', 'leadership')
-                  or (intent == 'introduction' and bool(ids))
-                  or (ids == [IDENTITY.entity_id] and intent == 'personality')
-                  or (not ids and intent in ('introduction', 'personality', 'leadership')))
+    # Only a real profile can short-circuit retrieval. Reference-only faction
+    # nodes need mentions in other documents, including leadership questions.
+    has_profiles = bool(ids) and all(db.execute(
+        "SELECT 1 FROM entities WHERE id=? AND coverage!='reference_only'", (entity_id,)
+    ).fetchone() for entity_id in ids)
+    skip_dense = ((intent == 'introduction' and has_profiles)
+                  or (ids == [IDENTITY.entity_id] and intent == 'personality'))
     if skip_dense:
-        return _diversified(lexical, limit)
+        return _diversified(lexical, limit, ids)
 
     try:
         # Honor the exact SQLite DB supplied by the caller, not a different
@@ -77,7 +87,7 @@ def hybrid_ranked_search(db, question, *, ids=(), limit=8, kinds=None):
                                      db_file=Path(active_db_file))
     except (FileNotFoundError, OSError, RuntimeError, ValueError) as exc:
         print(f'[HybridRAG] 语义索引不可用；安全退回原检索：{exc}')
-        return _diversified(lexical, limit)
+        return _diversified(lexical, limit, ids)
 
     if ids:
         slots = ','.join('?' for _ in ids)
@@ -85,10 +95,8 @@ def hybrid_ranked_search(db, question, *, ids=(), limit=8, kinds=None):
             f'SELECT id,name,kind FROM entities WHERE id IN ({slots})', ids)}
     else:
         entities = {}
-    names = [entities[i]['name'] for i in ids if i in entities]
-    character_kinds = {'character', 'machine', 'fan_machine', 'dialogue_speaker'}
-    person_experience = (intent == 'experience' and bool(entities)
-                         and all(e['kind'] in character_kinds for e in entities.values()))
+    labels = _subject_names(db, ids)
+    person_focus = bool(entities) and all(e['kind'] in _PERSON_KINDS for e in entities.values())
     allow = set(kinds) if kinds is not None else None
 
     # Re-fetch FULL SQLite passage records. A dense result alone has no
@@ -113,15 +121,17 @@ def hybrid_ranked_search(db, question, *, ids=(), limit=8, kinds=None):
         if allow is not None and row['kind'] not in allow:
             continue
         owner = row['ref_id'] in ids
-        if person_experience and not owner:
+        mentioned = _mentioned_subjects(row, labels)
+        if person_focus and intent in ('introduction', 'personality') and not owner:
             continue
-        if ids and intent in ('introduction', 'general', 'personality', 'concept') and not owner:
+        if ids and not mentioned:
             continue
-        if ids and not owner and not any(name in row['content'] for name in names):
-            continue
-        if intent == 'concept' and not ids and not _concept_definition(question, row['content']):
+        if intent == 'relationship' and len(ids) >= 2 and len(mentioned) < 2:
             continue
         row['semantic_similarity'] = hit['score']
+        row['matched_subject_ids'] = sorted(mentioned)
+        row['evidence_role'] = ('owner_summary' if owner else 'event_context'
+                                if row['kind'] == 'event' else 'mentioned_context')
         dense.append(row)
 
     # 无明确人物时，过滤只有极少查询关键词重合的词法候选。
@@ -172,7 +182,7 @@ def hybrid_ranked_search(db, question, *, ids=(), limit=8, kinds=None):
         item['score'] = item['fusion_score']
         fused.append(item)
     fused.sort(key=lambda row: (-row['fusion_score'], row['id']))
-    output = _diversified(fused, limit)
+    output = _diversified(fused, limit, ids)
     print(f'[HybridRAG] 词法候选={len(lexical)}，有效向量候选={len(dense)}，融合输出={len(output)}')
     return output
 

@@ -5,9 +5,24 @@ from friston2.npc.identity import IDENTITY
 
 def _all_aliases(db):
     rows = [dict(row) for row in db.execute('''SELECT a.alias_norm,a.alias,a.entity_id,a.priority,
-      a.origin,e.name,e.kind
+      a.origin,e.name,e.kind,e.source_key
       FROM aliases a JOIN entities e ON a.entity_id=e.id
       ORDER BY a.priority DESC,a.entity_id''').fetchall()]
+    # Reference nodes are imported from relation labels, not from a small
+    # curated faction list. They have no independent biography. Repeated labels
+    # form one lookup topic; retrieval still checks every original source edge.
+    canonical = {row['alias_norm'] for row in rows}
+    references = db.execute("SELECT id,name,kind FROM entities WHERE kind='reference' ORDER BY id")
+    for entity in references:
+        word = normalize(entity['name'])
+        if (len(word) < 2 or len(word) > 24 or word in canonical
+                or _generic_speaker_label(word)
+                or re.search(r'[（(；;]', entity['name'])):
+            continue
+        canonical.add(word)
+        rows.append({'alias_norm': word, 'alias': entity['name'], 'entity_id': entity['id'],
+                     'priority': 10, 'origin': 'reference_label',
+                     'name': entity['name'], 'kind': entity['kind']})
     # A Chinese given-name prefix is useful for names such as 克丽斯腾·莱特.
     # Keep every candidate: shared prefixes must be diagnosed, never guessed.
     for row in tuple(rows):
@@ -80,12 +95,12 @@ def asks_personal_acquaintance(question):
 def _has_person_reference(question):
     """Require pronoun grammar rather than a character inside an unknown name."""
     q = normalize(question)
-    if any(word in q for word in ('那位', '那个人')):
+    if any(word in q for word in ('那位', '那个人')) or re.search(r'那(?:几|两|些)(?:位|个人)', q):
         return True
     # '其他人' is a new/unspecified topic; '他拉' could be an unknown name.
     # A standalone ending or a predicate/particle makes the reference explicit.
     return bool(re.search(
-        r'(?<!其)[他她它](?:们)?(?=$|的|和|与|跟|呢|吗|吧|呀|啊|是|有|会|能|'
+        r'(?<!其)[他她它](?:们(?:俩|两个)?|俩)?(?=$|的|和|与|跟|呢|吗|吧|呀|啊|是|有|会|能|'
         r'曾经|还|都|又|也|就|却|从|在|为什么|怎么|怎样|什么|说|做|去|见|'
         r'喜欢|讨厌|认识|认为|到|想|后来|以前|过去|最|究竟|到底|值得|性格|经历|情况|本人)', q))
 
@@ -107,10 +122,72 @@ def _ordinary_alias_span(text, alias, start, end):
                           text[:start]))
 
 
+def _embedded_group_name(text, end):
+    """A person alias inside a race/company name is not a named person.
+
+    Check each occurrence independently: a later explicit mention of the
+    operator must still resolve. Possessive wording and verbal '组织了' are
+    not group-name suffixes; '族长' remains a personal title.
+    """
+    suffix = text[end:]
+    if re.match(r'族(?!长)|家族|一族', suffix):
+        return True
+    return bool(re.match(
+        r'(?:有限公司|公司|集团|组织|协会|联合会|商会|学院|研究所|研究院)'
+        r'(?=$|的|是|有|在|和|与|跟|为什么|怎么|怎样|如何|哪|什么|吗|呢)', suffix))
+
+
+def _embedded_job_title(text, alias, end):
+    """Do not promote part of a longer occupational title to a person.
+
+    These are language-level title forms, not names of lore characters.
+    A standalone title still follows the normal alias/ambiguity path.
+    """
+    titles = {*_GENERIC_SPEAKER_ROLES, '首席', '副手', '副主任', '教授', '博士', '院长', '院士'}
+    if alias not in titles:
+        return False
+    suffix = text[end:]
+    if alias == '博士' and re.match(r'后|生', suffix):
+        return True
+    compound = re.match(r'[\u3400-\u9fff]{1,6}(?:官|师|家|员|长)|顾问|助理|教授|助教', suffix)
+    if not compound:
+        return False
+    # Function words/predicates introduce a new clause, not a title modifier:
+    # e.g. 主任和园丁, 博士是科学家, 首席喜欢艺术家.
+    return not re.search(
+        r'[的和与跟是在把被让说叫问想看会能要不没也又都很更最比像呢吗吧谁哪怎如]|'
+        r'喜欢|讨厌|认为|觉得|帮助|性格|经历|过去|后来|曾经|负责', compound.group())
+
+
+def _locative_event_title(alias, source_key=''):
+    """Very short record titles need an explicit story label, not bare 'in'."""
+    return len(normalize(alias)) >= 3 or bool(re.match(r'^(?:act\d|main_)', source_key or ''))
+
+
+def _explicit_event_reference(question, alias, source_key=''):
+    """Recognize event syntax while leaving ordinary abstract nouns alone."""
+    q, word = normalize(question), normalize(alias)
+    escaped = re.escape(word)
+    if (re.search(r'[《“「]' + re.escape(alias) + r'[》”」]', question)
+            or re.search(r'(?:活动|剧情|密录|故事|篇章)' + escaped, q)):
+        return True
+    if not _locative_event_title(alias, source_key):
+        return False
+    if _explicit_speaker_reference(question, alias):
+        return True
+    # Both "A在故事名中..." and "故事名里A..." are natural unquoted
+    # event references. No character or event-name allowlist is involved.
+    return bool(re.search(escaped + r'(?:的)?(?:剧情|故事|活动|密录|篇章)(?:中|里|期间)', q)
+                or re.search(r'(?:在|于)' + escaped + r'(?:中|里|期间)', q)
+                or re.search(r'^(?:(?:请问|请讲讲|讲讲|说说|聊聊)(?:一下)?)?' + escaped +
+                             r'(?:中|里|期间)', q))
+
+
 def resolve_entity_resolution(db, question, previous_entities=()):
     """Return explicit candidates and ambiguity, plus bounded pronoun resolution."""
     q = normalize(question)
     candidates = {}
+    mention_positions = {}
     mentions, ambiguities = [], []
     groups = {}
     for row in _all_aliases(db):
@@ -128,13 +205,13 @@ def resolve_entity_resolution(db, question, previous_entities=()):
         priority = max(row['priority'] for row in rows)
         best = list({row['entity_id']: row for row in rows if row['priority'] == priority}.values())
         row = best[0]
+        if all(item['kind'] in ('character', 'machine', 'fan_machine', 'dialogue_speaker') for item in best):
+            spans = [(a, b) for a, b in spans if not _embedded_group_name(q, b)
+                     and not _embedded_job_title(q, word, b)]
+            if not spans:
+                continue
         if row['kind'] == 'event' and len(word) <= 4:
-            # Short story titles such as “合作”“改变”“自我” are common
-            # words, not named people in an ordinary sentence.
-            named_story = (re.search(r'[《“「]' + re.escape(row['alias']) + r'[》”」]', question)
-                           or re.search(r'(?:活动|剧情|密录|故事)' + re.escape(word), q)
-                           or _explicit_speaker_reference(question, row['alias']))
-            if not named_story:
+            if not _explicit_event_reference(question, row['alias'], row.get('source_key', '')):
                 continue
         if (row['kind'] == 'dialogue_speaker' and _generic_speaker_label(row['name'])
                 and not _explicit_speaker_reference(question, row['alias'])):
@@ -144,7 +221,7 @@ def resolve_entity_resolution(db, question, previous_entities=()):
             # name-reference grammar, never by incidental substring.
             w=re.escape(word)
             inquiry = r'说说|谁是|介绍|认识|关于|聊聊|了解|知道|知不知道|怎么看|觉得|认为|评价'
-            tail = r'(?:是|的|和|与|跟|呢|吗|谁|怎么样|怎样|如何|$)'
+            tail = r'(?:是|的|和|与|跟|呢|吗|谁|什么|为何|为什么|怎么样|怎样|如何|$)'
             if not (re.search(r'^(?:你)?(?:' + inquiry + r')?(?:一下)?' + w + tail, q)
                     or re.search(r'(?:' + inquiry + r'|叫|和|与|跟)(?:一下)?' + w + tail, q)):
                 continue
@@ -159,12 +236,16 @@ def resolve_entity_resolution(db, question, previous_entities=()):
                 for item in best]})
             continue
         score = len(word) * 100 + row['priority']
+        mention_positions[row['entity_id']] = min(
+            mention_positions.get(row['entity_id'], len(q)), min(start for start, _ in spans))
         existing = candidates.get(row['entity_id'], -1)
         if score > existing:
             candidates[row['entity_id']] = score
             mentions.append({'id': row['entity_id'], 'name': row['name'],
                              'alias': row['alias'], 'origin': row['origin']})
-    ids = [key for key, _ in sorted(candidates.items(), key=lambda p: -p[1])]
+    # Preserve the user's subject order so budgets do not always favor the
+    # person with the longest name.
+    ids = sorted(candidates, key=lambda key: (mention_positions.get(key, len(q)), -candidates[key]))
     # A fuller name in this same question can settle its accompanying title.
     # Previous discussion alone cannot decide a title shared across timelines.
     unresolved = []
@@ -184,28 +265,52 @@ def resolve_entity_resolution(db, question, previous_entities=()):
     if any(s in question for s in self_patterns) or self_relation or self_social:
         ids = [IDENTITY.entity_id] + [i for i in ids if i != IDENTITY.entity_id]
     person_reference = _has_person_reference(question)
-    followup = (person_reference
-                or any(s in question for s in ('刚才', '继续', '接着', '然后呢'))
-                or q in ('为什么', '为什么呢', '为什么会这样', '为什么这么觉得', '为什么这样说',
+    bare_followup = q in ('为什么', '为什么呢', '为什么会这样', '为什么这么觉得', '为什么这样说',
                          '为什么这样觉得', '为什么这么说', '怎么说', '怎么说呢',
-                         '具体说说', '具体说说呢', '具体说说吧', '后来呢', '后来怎么样'))
+                         '具体说说', '具体说说呢', '具体说说吧', '后来呢', '后来怎么样',
+                         '继续', '继续说', '接着', '接着说', '然后呢')
+    followup = person_reference or bare_followup or any(s in question for s in ('刚才', '继续', '接着', '然后呢'))
     # Explicit names replace the topic unless a pronoun clearly denotes a
     # second participant ("她和博士"). Avoid dragging an unrelated old name
     # into a fresh question such as "可露希尔她是什么人".
-    needs_antecedent = not ids or any(s in question for s in (
-        '她和', '他和', '它和', '她与', '他与', '它与', '她跟', '他跟', '它跟',
-        '和她', '和他', '和它', '与她', '与他', '与它', '跟她', '跟他', '跟它'))
+    needs_antecedent = not ids or bool(re.search(
+        r'[他她它](?:们)?(?:和|与|跟)|(?:和|与|跟)[他她它](?:们)?', question))
     needs_antecedent = needs_antecedent or (self_relation and person_reference)
     used_previous = False
     if followup and needs_antecedent and not ambiguities:
-        # Third-person pronouns prefer the discussed other person over self.
-        previous = sorted(previous_entities, key=lambda item: item == IDENTITY.entity_id)
-        for entity_id in previous:
-            if entity_id not in ids and db.execute('SELECT 1 FROM entities WHERE id=?', (entity_id,)).fetchone():
-                ids.append(entity_id)
-                used_previous = True
-                break
-    ids = ids[:5]
+        previous = []
+        for entity_id in dict.fromkeys(previous_entities):
+            if entity_id in ids:
+                continue
+            row = db.execute('SELECT id,name FROM entities WHERE id=?', (entity_id,)).fetchone()
+            if row:
+                previous.append(dict(row))
+        plural = bool(re.search(r'(?<!其)[他她它](?:们|俩)|那(?:几|两|些)位|那(?:几|两|些)个人', question))
+        # Bare explanations retain the task's whole subject set. Plural
+        # references retain all third-person antecedents, not an arbitrary
+        # first member. The current speaker is never a third-person guess.
+        if bare_followup and not person_reference:
+            selected = previous
+        elif plural:
+            selected = [item for item in previous if item['id'] != IDENTITY.entity_id]
+        elif person_reference:
+            choices = [item for item in previous if item['id'] != IDENTITY.entity_id]
+            selected = choices if len(choices) == 1 else []
+            if len(choices) > 1:
+                reference = re.search(r'那个人|那位|(?<!其)[他她它](?!们)', question)
+                # Keep the existing ambiguity shape: a later explicit name
+                # selection can replace this exact pronoun in the original
+                # question through pending_reference.
+                ambiguities.append({'alias': reference.group() if reference else question,
+                                    'origin': 'conversation_reference',
+                                    'candidates': [{'id': item['id'], 'name': item['name'],
+                                                    'alias': item['name']} for item in choices]})
+        else:
+            selected = previous
+        for item in selected:
+            ids.append(item['id'])
+            used_previous = True
+    ids = ids[:8]
     return {'status': 'ambiguous' if ambiguities else 'resolved' if ids else 'unknown',
             'entity_ids': ids, 'mentions': mentions, 'ambiguities': ambiguities,
             'used_previous': used_previous}

@@ -414,7 +414,7 @@ def _relations(db, ids, intent='relationship', question='', limit=20):
                                         row['passage_id'], row['id']))[:max(1, int(limit))]
 
 
-def ranked_search(db, query, ids=None, limit=3, kinds=None):
+def ranked_search(db, query, ids=None, limit=3, kinds=None, *, intent=None):
     """Rank owner sections, direct relationships and explicit event mentions.
 
     Event mentions retrieve narrative context; they never establish participation
@@ -428,7 +428,7 @@ def ranked_search(db, query, ids=None, limit=3, kinds=None):
                 if (e := _entity(db, i))][:8]
     ids = [e['id'] for e in entities]
     names = [e['name'] for e in entities]
-    intent = detect_intent(query, entities)
+    intent = intent if intent in _CATEGORIES else detect_intent(query, entities)
     categories = _requested_categories(query, intent)
     labels = _subject_names(db, ids)
     event_scope = _event_scope_context(db, query, entities)
@@ -936,7 +936,7 @@ def _organization_definition_text(content, names):
     return best_text, best_score
 
 
-def build_evidence_packet(db, question, ids, max_chars=1900):
+def build_evidence_packet(db, question, ids, max_chars=1900, *, intent=None):
     """Build a query-focused packet from direct edges and source-owned text.
 
     The graph channel is bounded local retrieval, not global GraphRAG or a
@@ -944,7 +944,7 @@ def build_evidence_packet(db, question, ids, max_chars=1900):
     """
     max_chars = max(0, int(max_chars))
     entities = [e for i in dict.fromkeys(ids) if (e := _entity(db, i))][:8]
-    intent = detect_intent(question, entities)
+    intent = intent if intent in _CATEGORIES else detect_intent(question, entities)
     focused = [e['id'] for e in entities]
     names = [e['name'] for e in entities]
     labels = _subject_names(db, focused)
@@ -1134,7 +1134,7 @@ def build_evidence_packet(db, question, ids, max_chars=1900):
     direct_attribute_answer = bool(retrieval.get('direct_attribute_source_ids'))
     hits = [] if direct_pair_answer or direct_attribute_answer else hybrid_ranked_search(
         db, question, ids=focused, limit=30 if event_scope or concept_search else 14,
-        kinds=tuple(kind for kind in _KINDS if kind != 'relationship'))
+        kinds=tuple(kind for kind in _KINDS if kind != 'relationship'), intent=intent)
     if direct_pair_answer:
         retrieval['strategy'] = 'direct_source_relationships'
     elif direct_attribute_answer:

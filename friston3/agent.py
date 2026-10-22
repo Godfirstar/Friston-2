@@ -1,74 +1,92 @@
-
-import os
-import re
-
-from friston3.npc.dialogue import EXPLANATIONS, bare_text, conversation_act
-
-
-def _obviously_chat_only(instruction):
-    """Optional conservative fast route for clear NPC conversation.
-
-    Only bypasses the planner in favor of npc_talk. Never enables a physical
-    action, and does not bypass SkillManager's normal validation.
-    """
-    if os.getenv('FRISTON_NPC_ROUTE_FAST', '1') != '1':
-        return False
-    raw = str(instruction or '').strip()
-    if not raw or len(raw) > 500:
-        return False
-    # Ambiguous mentions of hardware (including newly planned arm controls)
-    # remain with Planner. False negatives here only cost speed, not safety.
-    if re.search(r'拍照|拍张|拍摄|自动拍|照相|合影|来一张|拍一|拍个|拍下|倒计时|倒数|相机|摄像头|镜头|机械臂|机器人手臂|舵机|夹取|抓取|递给|递我|拿给|帮我拿|移动|导航|执行|运行|打开|关闭|启动|停止|photo|camera|picture|capture|move|turn|grab', raw, re.I):
-        return False
-    if bare_text(raw) in EXPLANATIONS | {'好的', '好', '嗯', '明白了', '哈哈', '原来如此'}:
-        return True
-    if conversation_act(raw) in ('greeting', 'thanks', 'compliment', 'emotion',
-                                'acknowledgement', 'personal_report'):
-        return True
-    if re.match(r'^(?:(?:请|给我|简单|详细|先|再|能不能|可以)(?:简单|详细)?)*(?:认识|你认识|你知道|你觉得|你认为|你怎么看|如何看待|谈谈|聊聊|我想聊|介绍|讲讲|解释|说说|你最喜欢|你的理想|你去过|你喜欢)', raw):
-        return True
-    # Short noun/character questions such as "陈是谁" or "天灾是什么".
-    if re.fullmatch(r'[^，,。！!；;]{1,30}(?:是谁|是什么|怎么样|有哪些|吗|呢)[？?]?', raw):
-        return True
-    if re.search(r'为什么|为何|什么|怎么样|如何|谁|哪个|哪位|哪里|多少|是不是|对吧|我(?:指|说)的是|[？?]$', raw):
-        return True
-    return False
+"""One planning decision, then the existing skill validation/execution boundary."""
+from copy import deepcopy
+from time import perf_counter
 
 
 class Agent:
-    """通过 Planner 生成技能调用，再交由管理器执行。"""
-
     def __init__(self, skill_manager, planner):
-        self.skill_manager = skill_manager
-        self.planner = planner
+        self.skill_manager, self.planner = skill_manager, planner
 
     def handle(self, instruction):
+        if not isinstance(instruction, str) or not instruction.strip():
+            return {"success": False, "message": "请输入具体内容。"}
+        instruction = instruction.strip()
+        if len(instruction) > 500:
+            return {"success": False, "message": "单次输入请控制在500字以内。"}
+        started = perf_counter()
         print(f"[Agent] 收到指令: {instruction}")
-
-        # 1. Clearly bounded greetings/thanks cannot request an action.
-        # Avoid an extra model call just to route them to npc_talk.
-        if (instruction.startswith(("记住：", "记住:", "忘记：", "忘记:"))
-                or _obviously_chat_only(instruction)):
-            call = {'skill': 'npc_talk', 'arguments': {}}
-            print('[Agent] 仅绕过设备 LLMPlanner；NPC 内部仍独立判断是否需要事实检索')
-        else:
-            call = self.planner.plan(instruction)
-
-        if call is None:
-            return {
-                "success": False,
-                "message": "暂不支持这条指令"
-            }
-
-        if call["skill"] == "npc_talk":
-            call["arguments"] = {
-                "user_text": instruction
-            }
-
-        print(f"[Agent] 工具调用: {call}")
-
-        # 2. 由 Skill Manager 验证并执行
-        return self.skill_manager.execute(
-            call["skill"],
-            call["arguments"]
-        )
+        npc = self.skill_manager.skills.get("npc_talk")
+        context, routed_to_npc, planning_trace_written = None, False, False
+        try:
+            # Explicit command syntax remains a protocol, not intent inference.
+            if instruction.startswith(("记住：", "记住:", "忘记：", "忘记:")):
+                call = {"skill": "npc_talk", "arguments": {}}
+            elif (getattr(self.planner, "supports_dialogue_context", False)
+                  and callable(getattr(npc, "prepare_route_context", None))
+                  and getattr(getattr(npc, "agentic", None), "enabled", False)):
+                context = npc.prepare_route_context(instruction)
+                call = self.planner.plan(instruction, dialogue_context=context)
+            else:
+                call = self.planner.plan(instruction)
+            if call is None:
+                planner_call = deepcopy(getattr(self.planner, "last_call", {}))
+                error = planner_call.get("status") == "error"
+                timed_out = planner_call.get("error_kind") == "timeout"
+                reply = ("本轮规划请求超时，尚未执行任何设备动作。输入“查看证据”可查看诊断。"
+                         if timed_out else
+                         "本轮规划未完成，尚未执行任何设备动作。输入“查看证据”可查看诊断。"
+                         if error else "这条指令暂不能执行；没有调用设备。")
+                # The CLI reads npc.last_trace. Record failures before NPC.execute
+                # too, without writing them into conversation or long-term memory.
+                if npc is not None and isinstance(getattr(npc, "last_trace", None), dict):
+                    attempted = bool(planner_call.get("request_attempted"))
+                    calls = [planner_call] if attempted else []
+                    signals = (context or {}).get("signals", {})
+                    elapsed = round(perf_counter() - started, 3)
+                    npc.last_trace = {
+                        "question": instruction,
+                        "route": "planning_failed" if error else "unsupported_skill",
+                        "output_origin": "planner_failure" if error else "unsupported_skill",
+                        "model_called": attempted, "generation_accepted": False,
+                        "fallback_used": False, "execution_started": False,
+                        "reply": reply, "subjects": [], "sent_sources": [],
+                        "retrieved_source_ids": [], "used_source_ids": [],
+                        "semantic_review_performed": False,
+                        "model_input": deepcopy(getattr(self.planner, "last_input", [])),
+                        "planner_call": planner_call, "ollama_calls": calls,
+                        "agentic_rag": {
+                            "decision": "UNAVAILABLE" if error else "UNSUPPORTED",
+                            "reason": "planner_timeout" if timed_out else
+                                      "planner_failure" if error else "unsupported_skill",
+                            "model_decision": None,
+                            "semantic": deepcopy(signals.get("semantic_evidence_demand", {})),
+                            "entity_resolution": deepcopy(signals.get("entity_resolution", {})),
+                            "retrieval_calls": 0, "model_calls": len(calls),
+                            "model_phases": [c["phase"] for c in calls], "elapsed_s": elapsed,
+                        },
+                        "elapsed_s": elapsed,
+                    }
+                    planning_trace_written = True
+                return {"success": False, "message": reply}
+            if call["skill"] == "npc_talk":
+                routed_to_npc = True
+                # Internal one-shot handoff: never expose model routing fields as
+                # public skill arguments or bypass SkillManager's validation.
+                if (context is not None and call.get("npc_decision") is not None
+                        and callable(getattr(npc, "accept_route_plan", None))):
+                    npc.accept_route_plan(instruction, call["npc_decision"], context,
+                                          getattr(self.planner, "last_input", []),
+                                          getattr(self.planner, "last_call", {}), started)
+                call = {"skill": "npc_talk", "arguments": {"user_text": instruction}}
+            print(f"[Agent] 工具调用: {call}")
+            return self.skill_manager.execute(call["skill"], call["arguments"])
+        finally:
+            if callable(getattr(npc, "discard_route_plan", None)):
+                npc.discard_route_plan()
+            elapsed = round(perf_counter() - started, 3)
+            if (routed_to_npc or planning_trace_written) and isinstance(getattr(npc, "last_trace", None), dict):
+                npc.last_trace["agent_elapsed_s"] = elapsed
+                if planning_trace_written:
+                    npc.last_trace["elapsed_s"] = elapsed
+                    npc.last_trace["agentic_rag"]["elapsed_s"] = elapsed
+            print(f"[Agent] 本轮总耗时 {elapsed:.3f}s（含规划与执行，不含语音合成/播放）")

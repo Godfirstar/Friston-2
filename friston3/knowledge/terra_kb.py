@@ -14,7 +14,6 @@ from friston3.config import KNOWLEDGE_DB, LORE_WIKI_SOURCE
 from friston3.knowledge.entity_resolver import resolve_entities, resolve_entity_resolution
 from friston3.knowledge.import_lore_wiki import import_lore_wiki
 from friston3.knowledge.lore_schema import DDL, DB_VERSION
-from friston3.knowledge.lore_text import normalize
 from friston3.knowledge.retrieve_lore import build_evidence_packet, detect_intent, get_card, ranked_search
 from friston3.npc.identity import IDENTITY
 
@@ -76,25 +75,34 @@ def _row_entity(db, entity_id):
 
 
 def retrieve_packet(question, *, previous_entities=(), retrieval_question=None,
+                    resolved_question=None, subject_ids=None, intent=None,
                     db_file=KNOWLEDGE_DB, max_chars=2500, **_compat):
     if not isinstance(question, str) or not question.strip():
         return {'context': '', 'intent': 'general', 'entity_ids': [], 'subjects': [], 'sources': [],
                 'resolution': {'status': 'unknown', 'entity_ids': [], 'mentions': [],
                                'ambiguities': [], 'used_previous': False}}
     with closing(connect(db_file)) as db:
-        resolution = resolve_entity_resolution(db, question, previous_entities)
+        # The caller supplies one contextualized task to resolution and search.
+        # Original user text remains available for attribution and diagnostics.
+        task = resolved_question if isinstance(resolved_question, str) and resolved_question.strip() else question
+        resolution = resolve_entity_resolution(db, task, previous_entities)
         ids = list(resolution['entity_ids'])
+        if subject_ids is not None and resolution['status'] != 'ambiguous':
+            # IDs come from the caller's SQLite resolution, never raw model text.
+            ids = [entity_id for entity_id in dict.fromkeys(subject_ids)
+                   if isinstance(entity_id, str) and _row_entity(db, entity_id)][:8]
+            if ids:
+                resolution = {**resolution, 'entity_ids': ids, 'status': 'resolved',
+                              'unresolved_reference': False}
         query = retrieval_question if isinstance(retrieval_question, str) and retrieval_question.strip() else question
         if resolution['status'] == 'ambiguous' or resolution.get('unresolved_reference'):
-            return {'context': '', 'intent': detect_intent(query), 'entity_ids': ids,
+            return {'context': '', 'intent': intent or detect_intent(query), 'entity_ids': ids,
                     'subjects': [{key: row[key] for key in ('id', 'name', 'kind', 'scope')}
                                  for entity_id in ids if (row := _row_entity(db, entity_id))],
                     'sources': [], 'resolution': resolution}
-        if normalize(question) in ('为什么', '为什么呢', '怎么说', '具体说说', '为什么这么说') and detect_intent(query) == 'relationship':
-            for entity_id in previous_entities:
-                if entity_id not in ids and _row_entity(db, entity_id):
-                    ids.append(entity_id)
-        packet = build_evidence_packet(db, query, ids, max_chars=max_chars)
+        packet = build_evidence_packet(db, query, ids, max_chars=max_chars, intent=intent)
+        packet['original_question'] = question
+        packet['resolved_question'] = task
         packet['entity_ids'] = ids
         packet['resolution'] = {**resolution, 'entity_ids': list(ids)}
         if IDENTITY.entity_id in ids and len(ids) >= 2 and not packet['sources']:
@@ -134,7 +142,9 @@ def reply_entity_mentions(reply, *, db_file=KNOWLEDGE_DB):
     with closing(connect(db_file)) as db:
         return [{'id': entity['id'], 'name': entity['name']}
                 for entity_id in resolve_entities(db, reply)
-                if (entity := _row_entity(db, entity_id)) and len(entity['name']) >= 2
+                # Name resolution already checks short aliases in context.
+                # Do not discard a resolved one-character character name.
+                if (entity := _row_entity(db, entity_id))
                 and entity['name'] in reply
                 and entity['kind'] in ('character', 'machine', 'fan_machine', 'dialogue_speaker')]
 

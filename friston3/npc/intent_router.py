@@ -1,9 +1,11 @@
-"""Independent semantic *evidence-demand* classifier for NPC dialogue.
+"""Advisory semantic signal for the NPC Agent's evidence-demand decision.
 
-This does NOT search the lore database. Its editable, labelled conversational
-examples are encoded with the same FastEmbed model already used by the lore
-retriever. Ambiguous classifications are deliberately delegated to AgenticRAG.
-Similarity and margin are ranking signals, NOT calibrated probabilities.
+This module does NOT search the lore database and must not be treated as the
+final authority for CHAT/RETRIEVE/LIVE decisions. Its editable labelled examples
+are encoded with the same FastEmbed model as the lore retriever. The AgenticRAG
+model makes the final routing choice when deterministic entity/context handling
+does not already require a bounded clarification or retrieval. Similarity and
+margin are ranking signals, NOT calibrated probabilities.
 """
 from __future__ import annotations
 

@@ -16,7 +16,7 @@ from pathlib import Path
 from friston3.knowledge.entity_resolver import resolve_entity_resolution
 from friston3.knowledge.lore_text import normalize, tokenize
 from friston3.knowledge.retrieve_lore import (
-    detect_intent, ranked_search, _subject_names, _mentioned_subjects, _PERSON_KINDS,
+    detect_intent, ranked_search, _subject_names, _mentioned_subjects, _PERSON_KINDS, _CATEGORIES,
     _requested_categories, _event_scope_context, _event_scoped_item,
 )
 from friston3.knowledge.semantic_index import search as semantic_search
@@ -56,7 +56,7 @@ def _diversified(rows, limit, ids=()):
     return selected[:limit]
 
 
-def hybrid_ranked_search(db, question, *, ids=(), limit=8, kinds=None):
+def hybrid_ranked_search(db, question, *, ids=(), limit=8, kinds=None, intent=None):
     """Fuse the existing safe lexical ranking with optional embedding hits.
 
     `ids` MUST be the entity resolver's explicit output, including [] for no
@@ -65,14 +65,14 @@ def hybrid_ranked_search(db, question, *, ids=(), limit=8, kinds=None):
     ids = list(dict.fromkeys(ids))
     limit = max(1, min(30, int(limit)))
     lexical = ranked_search(db, question, ids=ids,
-                            limit=max(SPARSE_CANDIDATES, limit), kinds=kinds)
+                            limit=max(SPARSE_CANDIDATES, limit), kinds=kinds, intent=intent)
     if ids:
         slots = ','.join('?' for _ in ids)
         entities = {row['id']: dict(row) for row in db.execute(
             f'SELECT id,name,kind FROM entities WHERE id IN ({slots})', ids)}
     else:
         entities = {}
-    intent = detect_intent(question, entities.values())
+    intent = intent if intent in _CATEGORIES else detect_intent(question, entities.values())
 
     # A known person's introduction already has a high-confidence owner card.
     # Only a real profile can short-circuit retrieval. Reference-only faction
@@ -124,8 +124,11 @@ def hybrid_ranked_search(db, question, *, ids=(), limit=8, kinds=None):
     for hit in dense_hits:
         passage_id = int(hit['id'])
         row = by_id.get(passage_id)
-        if row is None or row['category'] == 'relationship':
+        if row is None:
             continue
+        # Relationship passages are eligible dense candidates too. They still
+        # pass through the same owner, entity, event-scope and source checks below;
+        # a vector hit alone never establishes that a relationship is true.
         row = _event_scoped_item(row, event_scope)
         if row is None:
             continue

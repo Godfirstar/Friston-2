@@ -1,5 +1,5 @@
 ﻿# Run ONCE with PowerShell inside an activated conda environment if desired.
-# No administrator rights, no Git commit, no modification of Friston-2 source files.
+# No administrator rights, no Git commit, no modification of Friston-3 source files.
 $ErrorActionPreference = 'Stop'
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $agent = Join-Path $here 'journal.py'
@@ -20,7 +20,7 @@ $link = $shell.CreateShortcut($linkPath)
 $link.TargetPath = $pySilent
 $link.Arguments = '"' + $agent + '" watch'
 $link.WorkingDirectory = $here
-$link.Description = 'Friston-2 source snapshot -> automatic Obsidian research logs'
+$link.Description = 'Friston-3 source snapshot -> automatic Obsidian research logs'
 $link.WindowStyle = 7
 $link.Save()
 
@@ -31,4 +31,4 @@ Write-Host '每次启动电脑后运行，无需手动 Git commit。'
 # Launch immediately. journal.py uses an instance lock to avoid duplicates.
 Start-Process -FilePath $pySilent -WorkingDirectory $here -ArgumentList ('"' + $agent + '" watch') -WindowStyle Hidden
 Write-Host ('现在开始后台监听。Obsidian 可打开: ' + (Join-Path $here 'vault')) -ForegroundColor Green
-Write-Host '首次运行先建立源码基线；之后代码连续约 5 分钟不再变化时自动生成日志。'
+Write-Host '无旧基线时先建立源码基线；之后按 config.json 中的模式和周期记录源码变化。'

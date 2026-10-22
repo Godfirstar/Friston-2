@@ -1,15 +1,15 @@
 import sqlite3
 
-from friston2.agent import Agent
-from friston2.skills.auto_photo import AutoPhotoSkill
-from friston2.hardware.camera import RealCamera
-from friston2.skills.photo import PhotoSkill
-from friston2.skills.manager import SkillManager
-from friston2.skills.npc import NpcTalkSkill
-from friston2.vision.yunet_observer import YuNetObserver
-from friston2.planner import LLMPlanner
-from friston2.config import CAMERA_INDEX
-from friston2.npc.identity import IDENTITY
+from friston3.agent import Agent
+from friston3.skills.auto_photo import AutoPhotoSkill
+from friston3.hardware.camera import RealCamera
+from friston3.skills.photo import PhotoSkill
+from friston3.skills.manager import SkillManager
+from friston3.skills.npc import NpcTalkSkill
+from friston3.vision.yunet_observer import YuNetObserver
+from friston3.planner import LLMPlanner
+from friston3.config import CAMERA_INDEX
+from friston3.npc.identity import IDENTITY
 from stackchan_integration import StackChanFaceEvents
 from stackchan_integration.voice_output import AgentSpeechOutput
 

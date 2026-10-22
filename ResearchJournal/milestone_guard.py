@@ -44,9 +44,9 @@ def eligible(path: str, config: dict) -> bool:
         return False
     if rel.name.casefold() in DISCARD_NAMES or rel.name.startswith('test_') or rel.name.endswith('_test.py'):
         return False
-    # Fail closed: only the Friston-2 application sources are tracked by default.
+    # Fail closed: only the Friston-3 application sources are tracked by default.
     project_path = path.replace('\\', '/')
-    trusted = project_path.startswith('friston2/') or project_path in {'main.py', 'preview.py'}
+    trusted = project_path.startswith('friston3/') or project_path in {'main.py', 'preview.py'}
     if not trusted and not any(fnmatch.fnmatch(project_path.casefold(), str(p).casefold())
                                for p in config.get('milestone_include_patterns', [])):
         return False
@@ -60,20 +60,20 @@ def eligible(path: str, config: dict) -> bool:
 
 def group_for(path: str) -> str:
     path = path.replace('\\', '/')
-    if path.startswith('friston2/knowledge/'):
+    if path.startswith('friston3/knowledge/'):
         return 'knowledge'
-    if path.startswith('friston2/npc/'):
+    if path.startswith('friston3/npc/'):
         return 'npc'
-    if path.startswith('friston2/vision/') or path == 'preview.py':
+    if path.startswith('friston3/vision/') or path == 'preview.py':
         return 'vision'
-    if path.startswith('friston2/hardware/'):
+    if path.startswith('friston3/hardware/'):
         return 'hardware'
-    if path.startswith('friston2/skills/'):
+    if path.startswith('friston3/skills/'):
         return 'skills'
-    if path in {'main.py', 'friston2/agent.py', 'friston2/planner.py', 'friston2/config.py'}:
+    if path in {'main.py', 'friston3/agent.py', 'friston3/planner.py', 'friston3/config.py'}:
         return 'agent'
-    if path.startswith('friston2/'):
-        return 'other-friston2'
+    if path.startswith('friston3/'):
+        return 'other-friston3'
     # Avoid arbitrary hierarchical identities, but support legitimate root scripts.
     return 'other'
 
@@ -164,7 +164,7 @@ def assess(j, group: str, candidate: dict, config: dict):
                 'reason': 'Changes exceed pre-review context; confirm the feature explicitly.',
                 'feature_label': group, 'evaluated_at': j.time_text(),
                 'signature': candidate['signature']}
-    prompt = f'''你是一位严格、保守的 Friston-2 机器人项目技术记录审查员。
+    prompt = f'''你是一位严格、保守的 Friston-3 机器人项目技术记录审查员。
 只需要**判断这批变动现在适不适合成为一篇正式的、围绕单一功能的研发笔记**，绝对不要写笔记。
 用户可能在开发中途离开电脑；静默时间不是任务完成证据。保守起见，不确定统一判 in_progress。
 - ready：变更连贯、聚焦一个技术问题，关键入口与调用逻辑已显现，不存在明确未完成的关键步骤；不表示已运行或验证成功。

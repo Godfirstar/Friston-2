@@ -1,7 +1,7 @@
 ---
 name: friston-research-journal
 version: 3.1
-summary: Evidence-grounded and learner-friendly Friston-2 research journal for Obsidian. Never change robot source or run tests.
+summary: Evidence-grounded and learner-friendly Friston-3 research journal for Obsidian. Never change robot source or run tests.
 ---
 
 # ResearchJournal v3.1 · Explain, trace, teach and maintain

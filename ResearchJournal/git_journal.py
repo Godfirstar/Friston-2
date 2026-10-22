@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Git-commit-triggered documentation worker for Friston-2 ResearchJournal.
+"""Git-commit-triggered documentation worker for Friston-3 ResearchJournal.
 
 The authoritative input is the committed Git tree, NOT the working directory,
 commit message, an idle timer, or the old feature baselines. Never executes
@@ -344,7 +344,7 @@ def status():
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Git-driven Friston-2 journal: no timer, no test execution')
+    parser = argparse.ArgumentParser(description='Git-driven Friston-3 journal: no timer, no test execution')
     parser.add_argument('command', choices=('enqueue', 'worker', 'status', 'retry'))
     parser.add_argument('commit', nargs='?')
     args = parser.parse_args()

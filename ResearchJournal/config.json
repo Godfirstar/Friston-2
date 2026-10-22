@@ -59,6 +59,8 @@
                                    "package-lock.json"
                                ],
     "chat_keywords":  [
+                          "Friston-3",
+                          "Friston3",
                           "Friston-2",
                           "PhotoRobot",
                           "CosRobot",
@@ -78,7 +80,7 @@
     "trigger_mode":  "timer",
     "timer_interval_seconds":  600,
     "timer_include_paths":  [
-                                "friston2/",
+                                "friston3/",
                                 "main.py",
                                 "preview.py"
                             ],

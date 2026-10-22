@@ -1,5 +1,5 @@
 ﻿# Install Git post-commit for ResearchJournal, without overwriting other hooks.
-# Requires an existing Git repo whose root equals Friston-2.
+# Requires an existing Git repo whose root equals the Friston-3 project directory.
 param([switch]$CheckOnly)
 $ErrorActionPreference = 'Stop'
 $homeDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -10,7 +10,7 @@ $gitExe = $gitCmd.Source
 $repoRoot = & $gitExe -C $project rev-parse --show-toplevel
 $gitExitCode = $LASTEXITCODE
 if ($gitExitCode -ne 0 -or [string]::IsNullOrWhiteSpace([string]$repoRoot)) {
-    throw 'Friston-2 is not a Git repository. Initialize Git first; installation made no changes.'
+    throw 'Friston-3 is not a Git repository. Initialize Git first; installation made no changes.'
 }
 $repoRoot = ([System.IO.Path]::GetFullPath($repoRoot)).TrimEnd('\','/')
 $projectCanonical = ([System.IO.Path]::GetFullPath($project)).TrimEnd('\','/')

@@ -112,7 +112,9 @@ B：曾招募 A，并在之后的行动中提供帮助。
 
 ## 项目身份与真实记忆
 
-运行说话人固定绑定原作节点 `wiki:char_4093_frston`（Friston-3）。`lore_wiki_graph_2` 构建不再注入旧的 Friston-2 节点、二号机别名或“最喜欢可露希尔”设定。通用资料仍只从上述 Wiki 发布文件导入；小份原作人格与直接关系依据保存在 `npc_character.json`，从游戏文本镜像核对，按相关性进入当轮输入，并在 `sent_sources` 保留出处。它们没有把全部二次 Wiki 资料升级为原作核验结果。
+运行说话人固定绑定原作节点 `wiki:char_4093_frston`（Friston-3，自称 Friston），当前 Python 包为 `friston3/`。`lore_wiki_graph_2` 构建不再注入旧的 Friston-2 节点、二号机别名或“最喜欢可露希尔”设定。通用资料仍只从上述 Wiki 发布文件导入；小份原作人格与直接关系依据保存在 `npc_character.json`，从游戏文本镜像核对，按相关性进入当轮输入，并在 `sent_sources` 保留出处。它们没有把全部二次 Wiki 资料升级为原作核验结果。
+
+检索结果只提供事实证据，普通回复由 Qwen 以角色口吻生成。模型生成失败不自动朗读检索片段；返回失败诊断并保留证据供检查。用户明确要求原文时，才进入专门的来源引用路径。
 
 自身原作背景和现实设备经历分开：可依据发给模型的自身原作证据用第一人称谈角色过去；这台设备的摄影结果、现实出行及会面仍只认执行记录。原作机器人不保有“保存者”完整日志和全部知识，不能把旧意识体的所有经历直接灌入当前记忆。
 
@@ -120,16 +122,16 @@ B：曾招募 A，并在之后的行动中提供帮助。
 
 ## 重建与检查
 
-先关闭正在使用知识库的程序，在项目根目录执行：
+本次上传附件不含 `data/`，已有可用知识库、角色卡和索引应沿用；代码合并不自动重建数据库。仅在确需构建或更新资料时，先备份数据并关闭正在使用知识库的程序，再在项目根目录手动执行：
 
 ```powershell
-python -m friston2.knowledge.terra_kb build --source data/external/arknights_lore_wiki
-python -m friston2.knowledge.terra_kb stats
-python -m friston2.knowledge.terra_kb card 可露希尔
-python -m friston2.knowledge.terra_kb profile 多萝西
-python -m friston2.knowledge.terra_kb relations 多萝西 --limit 12
-python -m friston2.knowledge.terra_kb search 矿石病 --limit 3
-python -m friston2.knowledge.terra_kb network 可露希尔 --depth 1 --limit 30 --output data/runtime/closure_graph.json
+python -m friston3.knowledge.terra_kb build --source data/external/arknights_lore_wiki
+python -m friston3.knowledge.terra_kb stats
+python -m friston3.knowledge.terra_kb card 可露希尔
+python -m friston3.knowledge.terra_kb profile 多萝西
+python -m friston3.knowledge.terra_kb relations 多萝西 --limit 12
+python -m friston3.knowledge.terra_kb search 矿石病 --limit 3
+python -m friston3.knowledge.terra_kb network 可露希尔 --depth 1 --limit 30 --output data/runtime/closure_graph.json
 ```
 
 构建在临时数据库中完成，成功后替换正式库。旧版数据库不能直接覆盖 v0.5 数据库；源数据更新后应重新构建。

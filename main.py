@@ -2,22 +2,50 @@ import sqlite3
 
 from friston3.agent import Agent
 from friston3.skills.auto_photo import AutoPhotoSkill
-from friston3.hardware.camera import RealCamera
+from friston3.hardware.camera import create_camera
 from friston3.skills.photo import PhotoSkill
 from friston3.skills.manager import SkillManager
 from friston3.skills.npc import NpcTalkSkill
 from friston3.vision.yunet_observer import YuNetObserver
 from friston3.planner import LLMPlanner
-from friston3.config import CAMERA_INDEX
+from friston3.config import CAMERA_SOURCE, INPUT_MODE
 from friston3.npc.identity import IDENTITY
 from stackchan_integration import StackChanFaceEvents
 from stackchan_integration.voice_output import AgentSpeechOutput
+from stackchan_integration.voice_input import StackChanSpeechInput
 
 
 
 def main():
-    print(f"{IDENTITY.name} 启动（真实摄像头模式）")
-    camera = RealCamera(index=CAMERA_INDEX)
+    if INPUT_MODE not in ("text", "stackchan"):
+        raise ValueError("FRISTON_INPUT_MODE 只能设为 stackchan 或 text")
+    source_label = "栈酱摄像头" if CAMERA_SOURCE == "stackchan" else "电脑摄像头"
+    input_label = "栈酱麦克风" if INPUT_MODE == "stackchan" else "键盘输入"
+    print(f"{IDENTITY.name} 启动（{source_label} / {input_label}）")
+    # 相机、麦克风、表情和播放必须共用这一个 COM 所有者。
+    face = StackChanFaceEvents()
+    camera = None
+    speech_input = None
+    try:
+        camera = create_camera(face)
+        if INPUT_MODE == "stackchan":
+            speech_input = StackChanSpeechInput(face)
+            speech_input.preload()
+        _run_session(face, camera, speech_input)
+    except (OSError, RuntimeError, TimeoutError, ValueError) as error:
+        print(f"[{IDENTITY.name}] 启动或设备输入失败：{error}")
+        print("检查 COM 端口、固件和本地语音模型后重新启动。")
+    except KeyboardInterrupt:
+        print(f"\n{IDENTITY.name} 已退出。")
+    finally:
+        if speech_input is not None:
+            speech_input.close()
+        if camera is not None:
+            camera.close()
+        face.close()
+
+
+def _run_session(face, camera, speech_input):
     manager = SkillManager()
 
     # 普通拍照与自动摄影共用同一个真实摄像头适配器。
@@ -47,29 +75,32 @@ def main():
     print("  查看证据：查看上一轮实际输入的主体、来源和处理路径")
     print("  退出：结束程序")
 
-    # 在 main() 生命周期内只建立一次硬件通信；后台线程独占串口。
-    # 可设 FRISTON_STACKCHAN_ENABLED=0 禁用；失联时不阻塞主流程。
-    face = StackChanFaceEvents()
     voice = AgentSpeechOutput(face)
     try:
         while True:
             try:
-                instruction = input("\n你: ").strip()
+                instruction = (
+                    speech_input.read() if speech_input is not None
+                    else input("\n你: ")
+                ).strip()
             except (EOFError, KeyboardInterrupt):
                 print(f"\n{IDENTITY.name} 已退出。")
                 break
 
-            if instruction.lower() in ("退出", "exit", "quit"):
+            # ASR 可能补上“退出。”；只归一化管理命令的比较值，
+            # 普通对话仍将原始转写交给 Agent，不硬改角色名或同音字。
+            command = instruction.rstrip("。！？!?.,，；; ").lower()
+            if command in ("退出", "exit", "quit"):
                 break
-            if instruction in ("查看证据", "/evidence"):
+            if command in ("查看证据", "/evidence"):
                 print(npc.explain_last_response())
                 continue
-            if instruction in ("清空记忆", "/clear"):
+            if command in ("清空记忆", "/clear"):
                 npc.clear_history()
 
                 print(f"{IDENTITY.name}: 本次会话的短期记忆已清空。")
                 continue
-            if instruction == "清空长期记忆":
+            if command == "清空长期记忆":
                 try:
                     npc.clear_all_memory()
                 except (OSError, sqlite3.Error, RuntimeError) as error:
@@ -105,7 +136,7 @@ def main():
                 # This also restores IDLE if synthesis/transmission fails.
                 face.on_reply_ready()
     finally:
-        face.close()
+        voice.close()
 
 
 if __name__ == "__main__":

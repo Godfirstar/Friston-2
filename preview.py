@@ -1,24 +1,26 @@
 import cv2
 
-from friston3.hardware.camera import RealCamera
+from friston3.hardware.camera import create_camera
 from friston3.vision.yunet_observer import YuNetObserver
 from friston3.vision.visualization import draw_faces
 
-from friston3.config import CAMERA_INDEX
+from friston3.config import CAMERA_SOURCE
+from stackchan_integration import StackChanFaceEvents
 
 
 def main():
-    camera = RealCamera(index=CAMERA_INDEX)
-    observer = YuNetObserver()
-
-    if not camera.open():
-        print(f"无法打开摄像头（设备索引：{CAMERA_INDEX}）")
-        return
-
-    print("Friston-3 视觉预览")
-    print("Q: 退出 | S: 拍照 | O: 输出观测")
-
+    # 预览单独运行；不要与 main.py 或串口监视器同时占用 COM10。
+    face = StackChanFaceEvents(enabled=CAMERA_SOURCE == "stackchan")
+    camera = None
     try:
+        camera = create_camera(face)
+        observer = YuNetObserver()
+        if not camera.open():
+            print(f"无法打开摄像头（来源：{CAMERA_SOURCE}）")
+            return
+
+        print(f"Friston-3 视觉预览（{CAMERA_SOURCE}）")
+        print("Q: 退出 | S: 拍照 | O: 输出观测")
         while True:
             frame = camera.read()
             if frame is None:
@@ -56,7 +58,9 @@ def main():
             elif key == ord("o"):
                 print("[Observation]", observation)
     finally:
-        camera.close()
+        if camera is not None:
+            camera.close()
+        face.close()
         cv2.destroyAllWindows()
 
 

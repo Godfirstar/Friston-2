@@ -20,3 +20,6 @@ NPC_REPLY_TOKENS = 192
 NPC_HISTORY_TURNS = 3
 NPC_HISTORY_TOKEN_BUDGET = 1100
 CAMERA_INDEX = 0
+# 输入设备明确选择；栈酱失联时不悄悄切换为电脑摄像头/麦克风。
+CAMERA_SOURCE = os.getenv("FRISTON_CAMERA_SOURCE", "stackchan").strip().lower()
+INPUT_MODE = os.getenv("FRISTON_INPUT_MODE", "stackchan").strip().lower()

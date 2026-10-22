@@ -29,6 +29,75 @@ def plain_text(text):
     return re.sub(r'\s+', ' ', text).strip()
 
 
+def complete_sentences(text):
+    """Split only outside balanced quotes/brackets; retain source punctuation."""
+    text = str(text or '')
+    pairs = dict(zip('“‘「『（(【[〔{《', '”’」』）)】]〕}》'))
+    stack, result, start = [], [], 0
+    for index, char in enumerate(text):
+        if stack and char == stack[-1]:
+            stack.pop()
+        elif char in pairs:
+            stack.append(pairs[char])
+        elif char in ('"', "'"):
+            # Apostrophes within Latin words are not quotation boundaries.
+            if not (char == "'" and index and index + 1 < len(text)
+                    and text[index - 1].isascii() and text[index - 1].isalnum()
+                    and text[index + 1].isascii() and text[index + 1].isalnum()):
+                stack.append(char)
+        if not stack and char in '。！？!?；;\n':
+            part = text[start:index + 1].strip()
+            if part:
+                result.append(part)
+            start = index + 1
+    tail = text[start:].strip()
+    if tail:
+        result.append(tail)
+    return result
+
+
+def source_spans(text):
+    """Return up to four complete source prefixes, preferring 60–180 chars.
+
+    Prefixes retain the subject and original attribution for later sentences.
+    Corrections stay whole when shortening could change their meaning.
+    """
+    text = str(text or '').strip()
+    sentences = complete_sentences(text)
+    if len(sentences) <= 1:
+        return [text] if text else []
+    earlier = r'最初|起初|当初|曾|原先|过去|以前|疑似|传闻|自称'
+    corrected = r'后来|此后|随后|最终|如今|现(?:在|任|为|作为)|真相|澄清|实为|并非|不是|非感染|未曾|实际上|事实上'
+    # Every candidate is a prefix, so its original speaker/frame is retained.
+    # Only a later correction can make an earlier account unsafe to select.
+    if (any(re.search(r'澄清|真相|更正|实际上|事实上|实为', part) for part in sentences[1:])
+            or any(re.search(corrected, text[match.end():]) for match in re.finditer(earlier, text))):
+        return [text]
+
+    qualification = re.compile(
+        r'但|然而|不过|相反|只是|并非|并不|不是|不等于|未必|未曾|不代表|不意味|'
+        r'实际上|事实上|后来|此后|随后|最终|如今|澄清|真相|更正')
+    ends, cursor = [], 0
+    for index, sentence in enumerate(sentences):
+        start = text.find(sentence, cursor)
+        end = start + len(sentence)
+        cursor = end
+        following = sentences[index + 1] if index + 1 < len(sentences) else ''
+        first_clause = re.split(r'[，,：:]', following, maxsplit=1)[0]
+        if not qualification.search(first_clause):
+            ends.append(end)
+    # A selector can choose a concise introduction or a longer factual
+    # prefix. Never offer an isolated pronoun or cut a qualifying next clause.
+    short = [end for end in ends if end <= 180]
+    chosen = [short[0]] if short else []
+    for target in (60, 100):
+        end = next((end for end in short if end >= target and end not in chosen), None)
+        if end is not None:
+            chosen.append(end)
+    chosen.append(len(text))
+    return [text[:end] for end in sorted(set(chosen))]
+
+
 def chunks(text, max_chars=420):
     """Retain complete sentences; a long indivisible sentence stays intact."""
     part = ''

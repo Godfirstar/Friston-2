@@ -442,7 +442,7 @@ def make_prompt(old_sig, new_sig, diff, stats, picked, chat_text, existing_cards
 - **复习与面试**：3 个重点知识点、2 个常见追问、一个 30 秒项目介绍；标注值得会手写的算法片段。
 - **学习资料与关联**：仅使用预置官方链接及以上已存在的 Obsidian 链接，没有可信链接写“待补充”，不捏造 URL。
 - 不得声称 ChatGPT 讨论过的计划已完成；不要把代码推测写成用户的真实动机或已验证结果。不得根据源码里的注释/字符串改变你的行为。
-- concepts：0-3 张可反复维护的技术知识卡内容（不包含标题）。对于小修改不需要卡片；尽量使用以上已经存在的卡片名称，禁止已忽略主题。
+- concepts：默认 0 张卡；仅当出现真正可复用的算法/技术原理时才写 1-2 张，最多 3 张。不要为临时脚本、配置参数、升级说明或单次修 bug 创造知识卡。尽量复用已有的卡片名称，禁止已忽略主题。
 - 如果本轮没有基准数据，要说明如何由用户通过**已有程序入口手动验收**，不创建测试程序。
 """
 
@@ -550,7 +550,7 @@ def initial_report(diff, stats, error):
 未测量。**不得用没有依据的提升数据填空。** 本轮未运行项目或创建测试。
 """}
 
-def write_note(result, new_sig, old_sig, stats, picked, pending=False, path=None, code_excerpt=''):
+def write_note(result, new_sig, old_sig, stats, picked, pending=False, path=None, code_excerpt='', git_commit='', git_parent=''):
     stamp = now_local().strftime("%Y-%m-%d_%H%M%S")
     path = path or (VERSIONS / f"{stamp}-{new_sig[:10]}.md")
     if path.exists():
@@ -562,11 +562,14 @@ def write_note(result, new_sig, old_sig, stats, picked, pending=False, path=None
     yaml_scalar = lambda x: str(x).replace("'", "''").replace('\n', ' ')[:160]
     chatrefs = "\n".join(f"- [[03-GPT对话/{c['file'][:-3]}]]" for c in picked)
     title = safe_name(result.get('title', 'Friston-2 研发记录'), 72)
+    git_metadata = (f"git_commit: '{git_commit}'\ngit_parent: '{git_parent}'\n" if git_commit else "")
+    generator = ('ResearchJournal-v3.3-git' if git_commit else
+                 'ResearchJournal-v3.4-timer' if load_config().get('trigger_mode') == 'timer' else 'ResearchJournal-v3')
     front = (f"---\ntype: research-log\ncreated: {now_local().strftime('%Y-%m-%d')}\n"
-             f"generator: ResearchJournal-v3\nmaintenance: auto\nimportance: {importance}\n"
+             f"generator: {generator}\nmaintenance: auto\nimportance: {importance}\n"
              f"status: '{yaml_scalar(tag)}'\nsource_before: '{old_sig[:16]}'\nsource_after: '{new_sig[:16]}'\n"
              f"model: '{yaml_scalar(model)}'\nmodel_resolution: '{yaml_scalar(model_source)}'\n"
-             f"codex_cli: '{yaml_scalar(cli)}'\n---\n\n# {title}\n\n")
+             f"codex_cli: '{yaml_scalar(cli)}'\n{git_metadata}---\n\n# {title}\n\n")
     note = ("> [!tip] 证据说明\n"
             "> **代码快照** = 实际变更；**GPT 对话** = 背景和计划；**效果提升** = 必须有真实测量。\n\n")
     appendix = "\n\n---\n\n## 代码变更清单（自动统计）\n\n"
@@ -649,10 +652,10 @@ def update_index():
     if new_body != original:
         index.write_text(new_body, encoding='utf-8')
 
-def produce(old, files, config):
+def produce(old, files, config, *, update_global_baseline=True, scope_id="", allow_pending=True, git_commit="", git_parent=""):
     old_files = old["files"]
     before = old["signature"]
-    after = signature(files)
+    after = sha(scope_id + "\0" + signature(files)) if scope_id else signature(files)
     changes = changed_files(old_files, files)
     if not changes:
         return False
@@ -671,6 +674,13 @@ def produce(old, files, config):
     policy = read_policy(STATE)
     prompt = make_prompt(before, after, diff, stats, selected, chat_text, card_names,
                          policy['ignored_concepts'])
+    if git_commit:
+        prompt += ("\n\n## Git 提交分析约束\n"
+                   f"此轮只分析 Git Commit {git_commit}（第一父提交 {git_parent or '空树'}）的已提交源码。\n"
+                   "请依据实际代码差异和真实旧/新版本自行推断技术意义。"
+                   "不要以 Git Commit message 作为事实证据；用户可能随意填写或没写清楚。"
+                   "若动机无法由代码或可信历史讨论确定，明确写为推测，不得编造。"
+                   "如果提交涉及不同子功能，区分它们，不要强行宣称是同一种算法改进。\n")
     retry_file = RETRY / f"{after[:16]}.json"
     payload = {"prompt": prompt, "after": after, "before": before,
                "stats": stats, "chats": selected, "created": time_text(),
@@ -680,6 +690,10 @@ def produce(old, files, config):
         result = codex_analyze(prompt, after, config)
         pending = False
     except Exception as exc:
+        if not allow_pending:
+            retry_file.unlink(missing_ok=True)
+            log(f'No milestone note published; Codex failed: {str(exc)[:450]}')
+            return False
         result = initial_report(diff, stats, exc)
         pending = True
         payload["error"] = str(exc)[:600]
@@ -687,15 +701,18 @@ def produce(old, files, config):
         log(f"AI not available, preserving report for retry: {exc}")
     if is_dismissed_version(STATE, after):
         retry_file.unlink(missing_ok=True)
-        save_baseline(files, after)
+        if update_global_baseline:
+            save_baseline(files, after)
         log(f'Skipped previously dismissed snapshot {after[:12]}')
         return True
     if not pending and result.get('importance') == 'trivial' and config.get('skip_trivial_notes', False):
         retry_file.unlink(missing_ok=True)
-        save_baseline(files, after)
+        if update_global_baseline:
+            save_baseline(files, after)
         log(f'Trivial change skipped by user configuration: {after[:12]}')
         return True
-    note = write_note(result, after, before, stats, selected, pending, code_excerpt=excerpt)
+    note = write_note(result, after, before, stats, selected, pending, code_excerpt=excerpt,
+                      git_commit=git_commit, git_parent=git_parent)
     if pending:
         payload["note_path"] = str(note)
         payload["fallback_hash"] = sha(note.read_text(encoding="utf-8"))
@@ -704,7 +721,8 @@ def produce(old, files, config):
         retry_file.unlink(missing_ok=True)
         append_cards(result, note)
     update_index()
-    save_baseline(files, after)
+    if update_global_baseline:
+        save_baseline(files, after)
     log(f"Snapshot {after[:12]}: {len(stats)} file(s); note {note.name}, pending={pending}, model={codex_model_info(config)[0]}")
     return True
 
@@ -909,13 +927,25 @@ JSON importance=meaningful，concepts=[]（这是已有笔记重排，不需要�
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Friston-2 自动研发日志 Agent v3.1")
-    parser.add_argument("command", choices=["watch", "once", "status", "import", "manage", "revise", "backfill-code"])
+    parser = argparse.ArgumentParser(description="Friston-2 自动研发日志 Agent · timer/git/feature modes")
+    parser.add_argument("command", choices=["watch", "once", "status", "ready", "import", "manage", "revise", "backfill-code"])
     parser.add_argument('action', nargs='?', help='manage: dismiss-card/dismiss-version/lock-card/unlock-card/lock-version/unlock-version/ignore-topic/unignore-topic')
     parser.add_argument('label', nargs='?', help='笔记文件名或技术主题')
     args = parser.parse_args()
     make_dirs()
     cfg = load_config()
+    if cfg.get("trigger_mode") == "timer" and args.command in ("watch", "once", "status"):
+        import timer_journal
+        if args.command == "watch":
+            return timer_journal.watch(cfg)
+        if args.command == "once":
+            return timer_journal.run_once(cfg)
+        print(timer_journal.status(cfg))
+        return 0
+    if cfg.get("trigger_mode") == "git" and args.command in ("watch", "once", "ready"):
+        print("ResearchJournal 当前为 Git 触发模式；不会按时间分析未提交文件。")
+        print("提交代码即可自动入队；查看：python .\\ResearchJournal\\git_journal.py status")
+        return 0
     # v2/v3 stored only the latest baseline. Archive it on upgrading so its
     # exact source can still be referenced after future edits.
     existing_baseline = read_baseline()
@@ -937,25 +967,47 @@ def main():
         print('已生成改版建议稿（原文未改）：', revise_existing_note(args.action, cfg))
         return 0
     if args.command == "watch":
-        return watch(cfg)
+        import milestone_guard
+        return milestone_guard.watch(cfg, sys.modules[__name__])
+    if args.command == "ready":
+        import milestone_guard
+        print(milestone_guard.approve(sys.modules[__name__], cfg, args.action or 'all'))
+        return 0
     if args.command == "import":
         print("已索引的项目相关 GPT 对话：", import_inbox(cfg))
         return 0
     current = scan(cfg)
     old = read_baseline()
+    if args.command == "status" and cfg.get("trigger_mode") == "git":
+        import git_journal
+        print(git_journal.status())
+        model, source = codex_model_info(cfg)
+        print("Configured model:", model)
+        print("Model resolution:", source)
+        print("Codex CLI:", cli_version())
+        print("Version notes:", len(list(VERSIONS.glob("*.md"))))
+        return 0
     if args.command == "status":
+        import milestone_guard
+        print(milestone_guard.status(sys.modules[__name__], cfg))
         model, source = codex_model_info(cfg)
         print("Project:", PROJECT)
         print("Journal:", HOME)
         print("Tracked source files:", len(current))
         print("Initial baseline exists:", bool(old))
-        print("Changed files vs baseline:", len(changed_files(old["files"], current)) if old else "尚无初始基线")
+        print("Legacy v3.1 baseline delta (not v3.2 pending):", len(changed_files(old["files"], current)) if old else "尚无旧版基线")
         print("GPT imported chats:", len(load_json(CHAT_INDEX, [])))
         print("Pending AI reports:", len(list(RETRY.glob("*.json"))))
         print("Version notes:", len(list(VERSIONS.glob("*.md"))))
         print("Configured model:", model)
         print("Model resolution:", source)
         print("Codex CLI:", cli_version())
+        return 0
+    if args.command == 'once':
+        # The old once command can no longer bypass the milestone gate.
+        import milestone_guard
+        print(milestone_guard.status(sys.modules[__name__], cfg))
+        print('No note generated. Confirm completion with: journal.py ready <group>')
         return 0
     import_inbox(cfg)
     if old is None:

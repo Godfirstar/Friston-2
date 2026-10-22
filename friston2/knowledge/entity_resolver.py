@@ -1,5 +1,8 @@
 """Name matching and short conversational reference resolution."""
+from functools import lru_cache
+from pathlib import Path
 import re
+import sqlite3
 from friston2.knowledge.lore_text import normalize
 from friston2.npc.identity import IDENTITY
 
@@ -36,6 +39,33 @@ def _all_aliases(db):
     return rows
 
 
+def _group_aliases(db):
+    groups = {}
+    for row in _all_aliases(db):
+        groups.setdefault(row['alias_norm'], []).append(row)
+    return tuple(sorted(groups.items(), key=lambda item: len(item[0]), reverse=True))
+
+
+@lru_cache(maxsize=2)
+def _file_alias_groups(path, mtime_ns, size):
+    """Reuse the immutable lore snapshot across short-lived read connections."""
+    with sqlite3.connect(Path(path).as_uri() + '?mode=ro', uri=True) as snapshot:
+        snapshot.row_factory = sqlite3.Row
+        return _group_aliases(snapshot)
+
+
+def _alias_groups(db):
+    path = db.execute('PRAGMA database_list').fetchone()[2]
+    if path and not db.in_transaction and not db.total_changes:
+        try:
+            stat = Path(path).stat()
+            return _file_alias_groups(path, stat.st_mtime_ns, stat.st_size)
+        except OSError:
+            pass
+    # In-memory or actively edited databases must observe their own snapshot.
+    return _group_aliases(db)
+
+
 _GENERIC_SPEAKER_ROLES = (
     '领袖', '领导', '老板', '负责人', '主任', '主管', '总工', '工程师', '研究员',
     '科学家', '医生', '护士', '病人', '患者', '干员', '队长', '队员', '士兵',
@@ -43,7 +73,7 @@ _GENERIC_SPEAKER_ROLES = (
     '秘书', '实习生', '老师', '学生', '村民', '居民', '路人', '男人', '女人',
     '老人', '孩子', '男孩', '女孩', '青年', '少女', '少年', '父亲', '母亲',
     '哥哥', '姐姐', '弟弟', '妹妹', '客人', '观众', '记者', '市民', '感染者',
-    '士官', '军官', '将军', '贵族', '代表', '仆人', '佣兵', '信使', '骑士',
+    '士官', '军官', '将军', '贵族', '代表', '仆人', '佣兵', '信使', '骑士', '教官',
 )
 
 
@@ -99,10 +129,22 @@ def _has_person_reference(question):
         return True
     # '其他人' is a new/unspecified topic; '他拉' could be an unknown name.
     # A standalone ending or a predicate/particle makes the reference explicit.
-    return bool(re.search(
+    if re.search(
         r'(?<!其)[他她它](?:们(?:俩|两个)?|俩)?(?=$|的|和|与|跟|呢|吗|吧|呀|啊|是|有|会|能|'
         r'曾经|还|都|又|也|就|却|从|在|为什么|怎么|怎样|什么|说|做|去|见|'
-        r'喜欢|讨厌|认识|认为|到|想|后来|以前|过去|最|究竟|到底|值得|性格|经历|情况|本人)', q))
+        r'喜欢|讨厌|认识|认为|到|想|后来|以前|过去|最|究竟|到底|值得|性格|经历|情况|本人|'
+        r'面对|遇到|碰到|参与|负责|担任|帮助|支持|保护|承担|采取|遭遇|应对|处理|具体|当时)', q):
+        return True
+    # A conversational subject at the start of a follow-up does not depend
+    # on a vocabulary of every possible verb. Explicit entity names still
+    # win in the caller; multiple antecedents still require clarification.
+    initial = re.match(
+        r'^(?:(?:那(?:么)?|所以|不过|对了|话说|至于|还有|接着|然后))*'
+        r'[他她它](?:们(?:俩|两个)?|俩)?(?!人|者|乡|国|处|日|年|事|物)', q)
+    name_question = re.fullmatch(
+        r'(?:那(?:么)?)?[他她它](?!们|俩)[\u3400-\u9fff]{1,20}'
+        r'(?:是谁|是什么人|是什么角色|叫什么|的档案)', q)
+    return bool(initial and not name_question)
 
 
 def _ordinary_alias_span(text, alias, start, end):
@@ -146,7 +188,13 @@ def _embedded_job_title(text, alias, end):
     titles = {*_GENERIC_SPEAKER_ROLES, '首席', '副手', '副主任', '教授', '博士', '院长', '院士'}
     if alias not in titles:
         return False
+    prefix = text[:end - len(alias)]
     suffix = text[end:]
+    if re.search(r'(?:担任|出任|就任|任命为|受聘为|成为)(?:了|过|一名|一位|一个)?$', prefix):
+        return True
+    if (re.search(r'(?:当|做)(?:了|过|一名|一位|一个)?$', prefix)
+            and re.match(r'$|呢|吗|吧|的(?:原因|理由|经历)|[了过]', suffix)):
+        return True
     if alias == '博士' and re.match(r'后|生', suffix):
         return True
     compound = re.match(r'[\u3400-\u9fff]{1,6}(?:官|师|家|员|长)|顾问|助理|教授|助教', suffix)
@@ -189,12 +237,8 @@ def resolve_entity_resolution(db, question, previous_entities=()):
     candidates = {}
     mention_positions = {}
     mentions, ambiguities = [], []
-    groups = {}
-    for row in _all_aliases(db):
-        groups.setdefault(row['alias_norm'], []).append(row)
     matched_spans = []
-    for word in sorted(groups, key=len, reverse=True):
-        rows = groups[word]
+    for word, rows in _alias_groups(db):
         if word not in q:
             continue
         spans = [(m.start(), m.end()) for m in re.finditer(re.escape(word), q)]
@@ -221,9 +265,13 @@ def resolve_entity_resolution(db, question, previous_entities=()):
             # name-reference grammar, never by incidental substring.
             w=re.escape(word)
             inquiry = r'说说|谁是|介绍|认识|关于|聊聊|了解|知道|知不知道|怎么看|觉得|认为|评价'
-            tail = r'(?:是|的|和|与|跟|呢|吗|谁|什么|为何|为什么|怎么样|怎样|如何|$)'
+            tail = (r'(?:是|的|和|与|跟|呢|吗|谁|什么|为何|为什么|怎么样|怎样|如何|'
+                    r'平时|平常|通常|一般|现在|以前|过去|曾经|最初|之间|会|能|有|在|擅长|负责|'
+                    r'养|种植|学习|练习|尝试|参加|参与|前往|离开|休息|$)')
             if not (re.search(r'^(?:你)?(?:' + inquiry + r')?(?:一下)?' + w + tail, q)
-                    or re.search(r'(?:' + inquiry + r'|叫|和|与|跟)(?:一下)?' + w + tail, q)):
+                    or re.search(r'(?:' + inquiry + r'|叫|和|与|跟|对|向|给|替|帮助?|让|被|由|'
+                                 r'建议|劝(?:说)?|鼓励|要求|邀请|指导|引导)'
+                                 r'(?:一下)?' + w + tail, q)):
                 continue
         # Avoid substring false positives from short latin alias names.
         if re.fullmatch(r'[a-z0-9_]+', word) and len(word) <= 3:
@@ -313,7 +361,8 @@ def resolve_entity_resolution(db, question, previous_entities=()):
     ids = ids[:8]
     return {'status': 'ambiguous' if ambiguities else 'resolved' if ids else 'unknown',
             'entity_ids': ids, 'mentions': mentions, 'ambiguities': ambiguities,
-            'used_previous': used_previous}
+            'used_previous': used_previous,
+            'unresolved_reference': bool(person_reference and not ids and not ambiguities)}
 
 
 def resolve_entities(db, question, previous_entities=()):

@@ -1,9 +1,8 @@
 import json
-import os
 from urllib.request import Request, urlopen
 from time import perf_counter
 
-from friston2.config import OLLAMA_MODEL, OLLAMA_CHAT_URL
+from friston2.config import OLLAMA_MODEL, OLLAMA_CHAT_URL, OLLAMA_OPTIONS, OLLAMA_KEEP_ALIVE
 
 
 class LLMPlanner:
@@ -93,12 +92,10 @@ class LLMPlanner:
             "format": schema,
             "stream": False,
             "think": False,
-            "keep_alive": os.getenv("FRISTON_OLLAMA_KEEP_ALIVE", "30s"),
+            "keep_alive": OLLAMA_KEEP_ALIVE,
             "options": {
+                **OLLAMA_OPTIONS,
                 "temperature": 0.2,
-                # Match the NPC request size when both share one model.
-                "num_ctx": 4096 if self.model == os.getenv(
-                    "FRISTON_CHAT_MODEL", "qwen2.5:14b") else 2048,
                 "num_predict": 96
             }
         }

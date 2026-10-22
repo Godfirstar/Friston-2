@@ -85,7 +85,7 @@ def retrieve_packet(question, *, previous_entities=(), retrieval_question=None,
         resolution = resolve_entity_resolution(db, question, previous_entities)
         ids = list(resolution['entity_ids'])
         query = retrieval_question if isinstance(retrieval_question, str) and retrieval_question.strip() else question
-        if resolution['status'] == 'ambiguous':
+        if resolution['status'] == 'ambiguous' or resolution.get('unresolved_reference'):
             return {'context': '', 'intent': detect_intent(query), 'entity_ids': ids,
                     'subjects': [{key: row[key] for key in ('id', 'name', 'kind', 'scope')}
                                  for entity_id in ids if (row := _row_entity(db, entity_id))],

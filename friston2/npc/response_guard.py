@@ -38,6 +38,10 @@ They classify the request only: the caller must consult relevant real records.
     if re.fullmatch(r"(?:请|麻烦你|能不能|可以)?(?:自我介绍|介绍(?:一下|下)?(?:你)?自己|介绍一下你|你是谁|你叫什么(?:名字)?|你的名字(?:是什么|是啥)?)(?:一下|吗|吧|呢|呀|啊|呗|好吗)?", bare):
         return "identity"
 
+    if (re.search(r'你(?:的)?(?:人格|意识|记忆|数据)', q)
+            and re.search(r'创造|制造|设计|来源|来自|提供|赋予|谁', q)):
+        return "personality_origin"
+
     creator = (
         r"(?:你的|你)(?:制造者|设计者|研发者|研发负责人|维护者|维护负责人|制作者)(?:是谁|叫什么|是哪位|是哪个|呢|$)",
         r"(?:谁|哪位)(?:负责)?(?:制造|设计|研发|制作|维护|造)(?:和维护)?(?:了|的)?你",
@@ -194,13 +198,15 @@ def _supported_self_memory(sentence, sources):
 
 
 _SELF_RELATION = re.compile(
-    r'(?:我|我们).{0,12}(?:认识|相识|熟识|熟悉|结识|信任|信赖|亲近|并肩|共事|合作)|'
+    r'(?<!自)(?:(?:我|我们).{0,12}(?:认识|相识|熟识|熟悉|结识|信任|信赖|亲近|并肩|共事|合作)|'
     r'(?:我的|(?:是|作为)我(?:的)?|我(?:最(?:为)?|唯一|特别).{0,6}的|和我|与我|跟我|同我|我们之间).{0,18}'
-    r'(?:朋友|好友|挚友|伙伴|同伴|搭档|同事|亲人|家人|恋人|上司|上级|下属|老师|导师|学生|'
-    r'父亲|母亲|哥哥|姐姐|弟弟|妹妹|监护人|助手|制造者|设计者|维护者)|'
+    r'(?:朋友|好友|挚友|熟人|伙伴|同伴|搭档|同事|亲人|家人|恋人|上司|上级|下属|老师|导师|学生|'
+    r'父亲|母亲|哥哥|姐姐|弟弟|妹妹|监护人|雇主|护卫|助手|制造者|设计者|维护者)|'
+    r'(?:我|我们)(?:既|也|还)?(?:是|担任|作为).{0,12}'
+    r'(?:导师|老师|监护人|雇主|护卫|朋友|熟人|伙伴|同事|搭档)|'
     r'(?:我|我们)(?:和|与|跟).{1,18}(?:朋友|伙伴|同伴|搭档|同事|共事|并肩|相识)|'
     r'(?:我|我们)(?:就是|是|算是).{0,10}(?:朋友|伙伴|同伴|同事|搭档)|'
-    r'(?:认识我|见过我|和我很熟)')
+    r'(?:认识我|见过我|和我很熟))')
 
 _NONASSERTIVE_RELATION = re.compile(
     r'不能|无法|不敢|还说不清|尚不清楚|不确定|没有依据|没法|不该|不能确认|'
@@ -208,13 +214,15 @@ _NONASSERTIVE_RELATION = re.compile(
 
 
 def _clauses(sentence):
-    return [part.strip() for part in re.split(r'[，,]|但是|不过|可是|而且|但', sentence) if part.strip()]
+    # A single character is not a reliable conjunction boundary: it can be
+    # part of a database entity name. Keep the full name available to matching.
+    return [part.strip() for part in re.split(r'[，,]|但是|不过|可是|而且', sentence) if part.strip()]
 
 
 def _relation_type_supported(sentence, proof):
     """A direct edge proves neither an arbitrary relationship type nor its rank."""
     requirements = (
-        (r'认识|相识|熟识|熟悉|结识|认识我|见过我|和我很熟',
+        (r'认识|相识|熟识|熟悉|熟人|结识|认识我|见过我|和我很熟',
          r'认识|相识|熟识|熟悉|结识|见面|见过|交流|交谈|互动|探望|拜访|讨论|共事|合作|设计|制造|改装'),
         (r'朋友|好友|挚友', r'朋友|好友|挚友'),
         (r'伙伴|同伴', r'伙伴|同伴'),
@@ -228,7 +236,8 @@ def _relation_type_supported(sentence, proof):
         (r'亲人|家人', r'亲人|家人'), (r'恋人', r'恋人'),
         (r'父亲', r'父亲'), (r'母亲', r'母亲'), (r'哥哥', r'哥哥|兄长'),
         (r'姐姐', r'姐姐'), (r'弟弟', r'弟弟'), (r'妹妹', r'妹妹'),
-        (r'监护人', r'监护人'), (r'助手', r'助手'),
+        (r'监护人', r'监护人'), (r'雇主', r'雇主|雇佣'), (r'护卫', r'护卫'),
+        (r'助手', r'助手'),
         (r'制造者|设计者|维护者', r'制造|设计|维护'),
         (r'多年|数年|很久', r'多年|数年|很久'),
         (r'从小|青梅竹马|一辈子|毕生', r'从小|青梅竹马|一辈子|毕生'),
@@ -262,6 +271,52 @@ def _self_relation_supported(sentence, targets, sources):
         if not direct or not _relation_type_supported(sentence, _support_text(direct)):
             return False
     return True
+
+
+def _documentary_familiarity(clause):
+    """Knowing a dossier is not an assertion of meeting its subject."""
+    archival = re.search(
+        r'我(?:在|从|通过).{0,8}(?:资料|档案|记录|文献)(?:中|里|上)?'
+        r'(?:所)?(?:熟悉|了解|认识|知道)|'
+        r'我(?:所)?(?:熟悉|了解)(?:[^，,。！？!?]{1,12}的)?(?:资料|档案|记录|文献)', clause)
+    if not archival:
+        return False
+    remainder = clause[:archival.start()] + clause[archival.end():]
+    if _SELF_RELATION.search(remainder):
+        return False
+    return not re.search(
+        r'私下|亲自|现实|见面|会面|见过|相识|结识|共事|并肩|往来|交情|私交|'
+        r'一起生活|相处|多年|很久|[一二三四五六七八九十\d]+年', clause)
+
+
+def _factual_voice(clause):
+    """Remove epistemic first-person framing, retaining any self-fact after it."""
+    return re.sub(
+        r'在我看来|依我看|据我(?:所)?(?:知|了解)|'
+        r'我(?:个人|也|更|倒|仍)?(?:认为|觉得|看来|知道|了解|读到|看到|听说|'
+        r'欣赏|敬佩|赞同|认可|喜欢|希望|愿意|想|建议)|'
+        r'我(?:在|从|通过).{0,8}(?:资料|档案|记录|文献)(?:中|里|上)?'
+        r'(?:所)?(?:读到|看到|得知|了解到|知道)', '', clause)
+
+
+def _borrowed_self_fact(clause, sources):
+    """Source wording about another actor cannot become the speaker's history."""
+    # “自我价值/自我认识” describes the named actor, not the speaker.
+    # Match the pronoun itself; a real “我 ... 自我” still needs self evidence.
+    if (not re.search(r'(?<!自)我', clause) or _documentary_familiarity(clause)
+            or _NONASSERTIVE_RELATION.search(clause) or re.search(r'如果|假如|假设|设想|要是', clause)
+            or _supported_self_memory(clause, sources)):
+        return False
+    terms = _claim_terms(clause)
+    if len(terms) < 3:
+        return False
+    for source in sources:
+        if _self_id() in (source.get('subject_id'), source.get('object_id')) or not _usable_source(source, qualified=True):
+            continue
+        overlap = terms & _claim_terms(source.get('text', ''))
+        if len(overlap) >= 3 and len(overlap) / len(terms) >= 0.5:
+            return True
+    return False
 
 
 def _elliptical_acquaintance(clause, subjects):
@@ -305,14 +360,14 @@ def _candidate_question(sentence, candidate_entities, user_text=''):
     if not names:
         return False
     value = re.sub(r'''[“”「」『』\"‘’']''', '', sentence).strip()
-    value = re.sub(r'[？?]$', '', value).strip()
+    value = re.sub(r'[。！？!?]+$', '', value).strip()
     # A comma can join the choice to a separate request for clarification.
     # Strip only a full, nonfactual meta-clause; never arbitrary trailing prose.
-    meta_words = (r'(?:请|你|您|明确|确认|指明|指定|说明|一下|具体|'
-                  r'指的|所指|指向|指代|是|哪一位|哪位|哪一个|哪个|谁|呢|吗|其中|的)+')
+    meta_words = (r'(?:请|你|您|能否|能不能|可以|能|麻烦|明确|确认|指明|指定|指认|说明|一下|具体|'
+                  r'指的|所指|指向|指代|是|哪一位|哪位|哪一个|哪个|一位|一个|谁|呢|吗|其中|的)+')
     parts = re.split(r'[，,]', value)
     if (len(parts) > 1 and re.fullmatch(meta_words, parts[-1].strip())
-            and re.search(r'明确|确认|指明|指定|说明', parts[-1])):
+            and re.search(r'明确|确认|指明|指定|指认|说明', parts[-1])):
         value = ','.join(parts[:-1]).strip()
     # Courtesy + requester can compose ("请问您想确认的..."). Removing
     # courtesy here changes no proposition; the full choice still must match.
@@ -328,7 +383,7 @@ def _candidate_question(sentence, candidate_entities, user_text=''):
     if among and (not among.group(1) or among.group(1) in user_text):
         return True
     pause = r'\s*[，,]?\s*'
-    requester = r'(?:(?:你|您)' + pause + r')?'
+    requester = r'(?:(?:你|您)(?:这里|这次|刚才|刚刚|现在)?' + pause + r')?'
     desire = r'(?:想(?:要)?|要|希望)?'
     inquiry = r'(?:询问|问|确认|了解|称呼)'
     reference = r'(?:是指|指的是|说的是|问的是|指|说的|是)'
@@ -342,10 +397,10 @@ def _candidate_question(sentence, candidate_entities, user_text=''):
         return True
     # Only repeat an actual user phrase, not an invented proposition disguised
     # as "你说的...". Candidate names alone cannot license that attribution.
-    topic_head = requester + r'(?:是)?(?:所?说|(?:所)?提到|口中|' + desire + inquiry + r')的?'
+    topic_head = requester + r'(?:是)?(?:所?说|所?指|(?:所)?提到|口中|' + desire + inquiry + r')的?'
     topic = re.fullmatch(
         r'(?:(?:' + topic_head + r'|请问)' + pause + r')?'
-        + r'([^，,。！？!?]{1,12}?)' + pause + r'(?:是指|指的是|指|是)' + pause + choice, value)
+        + r'([^，,。！？!?]{1,12}?)' + pause + r'(?:究竟|到底)?(?:是指|指的是|指|是)' + pause + choice, value)
     return bool(topic and topic.group(1) in user_text)
 
 
@@ -359,6 +414,55 @@ def _stage_action(clause):
         r'\s*我(?:轻轻|微微|缓缓|默默|慢慢|随即)?(?:地)?(?:'
         r'颔首|点了点头|摇了摇头|点头|摇头|'
         r'(?:拍了拍|拍着)(?:你的肩(?:膀)?|(?:身旁的|面前的)?(?:工作台|桌子|桌面)))', clause))
+
+
+def _invented_body_state(reply, user_text):
+    """Catch direct bodily claims, including an omitted subject in a greeting.
+
+    This is deliberately not a ban on food/sleep topics: advice, questions to
+    the visitor, denied needs, metaphors and hypothetical talk remain valid.
+    """
+    actual = (r'(?:吃(?:过|了)(?!亏|苦|惊|教训)|吃(?:饱|完)|喝(?:过|了|完)|睡(?:过|了|醒|得)|'
+              r'(?:还|尚)?没(?:有)?(?:吃|喝|睡)|刚(?:刚)?醒|失眠|'
+              r'(?:饿|渴|困)(?:了|得|坏)|肚子(?:有点|很|真|太)?饿)')
+    nonactual = r'如果|假如|假设|要是|倘若|想象|假装|不需要|无需|不用|不会|不能|并不|不觉得|不感到'
+    # An immediate answer often drops "我": "午饭还没吃" / "昨晚没睡".
+    # Limit this to the reply's opening, before another named person's story
+    # can establish a different subject. Questions/advice are not self-reports.
+    opening_match = re.match(r'\s*([^，,。！？!?；;]+)([，,。！？!?；;]?)', reply)
+    if opening_match:
+        opening, ending = opening_match.groups()
+        time_or_meal = (r'(?:今天|今早|今晚|昨晚|昨天|昨夜|现在|这会儿|刚才|刚刚|'
+                        r'早上|上午|中午|下午|晚上|早饭|午饭|晚饭|早餐|午餐|晚餐)')
+        if (ending not in ('?', '？') and not re.search(r'(?:吗|么|吧)$', opening)
+                and not re.search(nonactual, opening)
+                and not re.search(r'你|您|大家|他|她|它|的是|的那|的人|的角色|要记得|别忘了', opening)
+                and re.match(r'^' + time_or_meal + r'(?:倒是|其实|确实|已经|还|也|都|就)?' + actual, opening)):
+            return True
+    for sentence in re.split(r'[。！？!?；;]', reply):
+        if re.search(r'如果|假如|假设|要是|倘若|想象|假装', sentence):
+            continue
+        for clause in re.split(r'[，,]|但是|不过|可是|而且', sentence):
+            if re.search(nonactual, clause) or re.search(r'你|您|大家', clause):
+                continue
+            if re.search(r'(?:^|\s)我(?:自己)?[^，,。！？!?；;]{0,12}' + actual, clause):
+                return True
+            if re.search(r'^\s*我(?:现在|今天|刚才)?(?:也|还|已经)?(?:有点|很|真|太)?(?:饿|渴|困)\s*$', clause):
+                return True
+    # "还没呢" is a bodily claim only when answering a bodily question about
+    # the speaker, not after a visitor's report or a question about a task.
+    question = _normalized(user_text)
+    bodily_question = re.match(
+        r'^(?:那(?:么)?)?(?:你(?:今天|刚才|昨晚|现在|早上|中午|晚上)?'
+        r'(?:有没有|是不是|是否|已经|还|都|刚)?|(?:早饭|午饭|晚饭|早餐|午餐|晚餐)?)'
+        r'(?:吃|喝|睡|饿|渴|困|醒)', question)
+    if not bodily_question:
+        return False
+    opening = re.split(r'[，,。！？!?；;]', reply.strip(), maxsplit=1)[0]
+    opening = re.sub(r'^(?:嗯|啊|哈哈)[，,\s]*', '', opening)
+    return bool(re.fullmatch(
+        r'(?:还没(?:有)?|没(?:有)?|吃过|吃了|吃饱了|喝过|喝了|睡过|睡了|睡醒了|醒了|饱了|饿了|渴了|困了)'
+        r'(?:呢|了|呀|啊|哦)?', opening))
 
 
 def _whole_quoted_text(reply):
@@ -382,13 +486,158 @@ def _social_scolding(reply, act):
         reply))
 
 
-def validate_reply(reply, subjects, sources, mentioned_entities=(), *, user_text='', act='', user_role='', candidate_entities=()):
+def _number_value(value):
+    """Compare Arabic and common Chinese quantities without model inference."""
+    digits = dict(zip('零〇一二两三四五六七八九', (0, 0, 1, 2, 2, 3, 4, 5, 6, 7, 8, 9)))
+    if not value:
+        return 0
+    for unit, scale in (('亿', 100000000), ('万', 10000)):
+        if unit in value:
+            left, right = value.split(unit, 1)
+            return (_number_value(left) or 1) * scale + _number_value(right)
+    if re.fullmatch(r'\d+(?:\.\d+)?', value):
+        return float(value)
+    if all(char in digits for char in value):
+        return int(''.join(str(digits[char]) for char in value))
+    total, number = 0, 0
+    for char in value:
+        if char in digits:
+            number = digits[char]
+        else:
+            total += (number or 1) * {'十': 10, '百': 100, '千': 1000}[char]
+            number = 0
+    return total + number
+
+
+def _quantities(text, entity_names=()):
+    """Extract factual counts/dates, excluding names and discourse numbering."""
+    for name in sorted(set(entity_names), key=len, reverse=True):
+        if name:
+            text = text.replace(name, ' ')
+    # Model identifiers and alphanumeric names are not quantities. Registered
+    # Chinese aliases were removed above using the database's own names.
+    text = re.sub(r'[A-Za-z][A-Za-z0-9_.-]*\d[A-Za-z0-9_.-]*', ' ', text)
+    text = re.sub(r'(?m)^\s*\d+[、.)]\s*', '', text)
+    text = re.sub(r'(?<=\d),(?=\d{3}(?:\D|$))', '', text)
+    pattern = (r'\d+(?:\.\d+)?[万亿]?|'
+               r'[零〇一二两三四五六七八九十百千万亿]+'
+               r'(?=[多余来]?(?:个|位|名|年|岁|天|日|月|小时|分钟|秒|届|次|支|组|家|台|人|枚|米|吨|种|倍|%|％))')
+    values = set()
+    for match in re.finditer(pattern, text):
+        value = _number_value(match.group())
+        suffix = text[match.end():]
+        prefix = text[max(0, match.start() - 5):match.start()]
+        # "一位科学家" introduces a person; it does not assert a population.
+        if (value == 1 and re.match(r'[个位名种台家]', suffix)
+                and not re.search(r'共|只有|仅有|仅|至少|至多|超过|不足|不到|有$', prefix)):
+            continue
+        values.add(value)
+    return values
+
+
+def _unsupported_quantity(reply, sources, entities, subjects=(), user_text=''):
+    if not sources:
+        return False  # Numerical advice in ordinary chat is not a lore claim.
+    entities = list(entities)
+    names = [entity.get('name', '') for entity in entities]
+    names += list(_self_names())
+    # Remove only the participant-count phrase; another occurrence of the
+    # same number (for example a duration) still needs its own source number.
+    participants = subjects or entities
+    participant_count = len({entity.get('id') for entity in participants if entity.get('id')})
+    # A missing name in the DB does not erase a participant explicitly named
+    # by the user. This licenses only "two people" in an uncertainty statement,
+    # never user-supplied dates, durations or populations as factual evidence.
+    if (participant_count < 2 and _NONASSERTIVE_RELATION.search(reply)
+            and re.search(r'[^，,。！？!?、]{1,18}[和与跟][^，,。！？!?、]{1,18}', user_text)):
+        reply = re.sub(r'[两二2]人(?!格)', '双方', reply)
+    reply = re.sub(r'([两二三四五六七八九十]|[2-9])人(?!格)',
+                   lambda match: '双方' if _number_value(match.group(1)) == participant_count
+                   else match.group(), reply)
+    claimed = _quantities(reply, names)
+    if not claimed:
+        return False
+    proof = '\n'.join(source.get('text', '') for source in sources
+                      if _usable_source(source, qualified=True))
+    supported = _quantities(proof, names)
+    return bool(claimed - supported)
+
+
+def _unsupported_pair_denial(reply, user_text, subjects, sources):
+    """Missing records cannot support a categorical bare 'no' to a pair query."""
+    pair = {subject['id'] for subject in subjects if subject.get('id')}
+    if len(pair) != 2 or not re.search(r'是不是|是否|有没有|[吗么][？?。!！]*$', user_text):
+        return False
+    if not re.match(r'\s*(?:不是|并不是|不对|并非如此|没有(?:关系)?)[。！!，,]', reply):
+        return False
+    names = [subject.get('name', '') for subject in subjects]
+    for source in sources:
+        if not _usable_source(source):
+            continue
+        body = source.get('text', '')
+        owners = {source.get('subject_id'), source.get('object_id')}
+        if not pair <= owners and not all(name and name in body for name in names):
+            continue
+        for clause in re.split(r'[。！？!?；;，,]', body):
+            if re.search(r'(?:没有|无|未|缺少|缺乏).{0,16}(?:记载|资料|信息|记录|证据|依据)', clause):
+                continue
+            if re.search(r'不是|并非|没有|并没有|从未|未曾|不存在|不属于', clause):
+                return False
+    return True
+
+
+def _contradicted_personality_origin(reply, sources, entities=(), user_text=''):
+    """Keep an explicit 'did not create my personality' source negative.
+
+    A body's designer is not thereby the supplier of its personality. Only
+    self-owned evidence with an explicit denial activates this narrow check.
+    Pronouns follow the most recent named person, never a fixed character.
+    """
+    excluded = set()
+    personality = r'人格(?:数据|程式|程序)?'
+    for source in sources:
+        name = source.get('object_name', '')
+        if (not name or source.get('subject_id') != _self_id()
+                or not _usable_source(source)):
+            continue
+        actor = '(?:' + re.escape(name) + r'|她|他|对方)'
+        if re.search(personality + r'(?:并)?(?:不是|并非)(?:由)?' + actor
+                     + r'(?:所)?(?:创造|制造|设计|研发)', source.get('text', '')):
+            excluded.add(name)
+    if not excluded:
+        return False
+    names = excluded | {entity.get('name', '') for entity in entities
+                        if entity.get('id') != _self_id() and entity.get('name')}
+    actor = '(?:' + '|'.join(re.escape(name) for name in sorted(names, key=len, reverse=True)) + r'|她|他|对方)'
+    action = r'(?:创造|制造|设计|研发|生成|赋予|提供)'
+    patterns = (
+        r'(?P<actor>' + actor + r').{0,16}' + action + r'(?:了)?(?:我(?:的)?)?' + personality,
+        personality + r'.{0,8}(?P<actor>' + actor + r')(?:所)?' + action,
+        action + r'(?:了)?(?:我(?:的)?)?' + personality + r'(?:的)?(?:是|来自)(?P<actor>' + actor + r')',
+        personality + r'(?:是)?(?:来自|出自|源自)(?P<actor>' + actor + r')',
+    )
+    explicit = sorted((user_text.rfind(name), name) for name in names if name in user_text)
+    antecedent = explicit[-1][1] if explicit else next(iter(names)) if len(names) == 1 else ''
+    for clause in re.split(r'[，,。！？!?；;]|不过|但是|但|却|而是', reply):
+        named = sorted((clause.find(name), name) for name in names if name in clause)
+        if named:
+            antecedent = named[-1][1]
+        if re.search(r'不是|并非|没有|未曾|不能|无法|不确定|不清楚|不负责|不曾|不由|不等于|不代表', clause):
+            continue
+        for pattern in patterns:
+            match = re.search(pattern, clause)
+            if match and (match['actor'] if match['actor'] in names else antecedent) in excluded:
+                return True
+    return False
+
+
+def validate_reply(reply, subjects, sources, mentioned_entities=(), *, user_text='', act='', user_role='', candidate_entities=(), source_excerpt=False):
     """Conservative, lightweight rules; NOT a semantic fact-proof engine.
 
-    Check speaker, device actions, named entities and surface role/relationship
-    claims against the sources actually sent (not the full retrieval packet).
-    Passing these rules does not certify all paraphrases or story details. The
-    optional social-style check is a narrow heuristic, not a semantic evaluator.
+    Check source ownership, speaker identity and device actions locally.
+    source_excerpt skips lexical checks only for verbatim database excerpts;
+    it must not be interpreted as a factuality verdict. Passing these rules does
+    not certify arbitrary paraphrases, relationship labels or story details.
     user_role must come from explicit dialogue state, never model-generated text.
     """
     issues = []
@@ -400,6 +649,12 @@ def validate_reply(reply, subjects, sources, mentioned_entities=(), *, user_text
     # Only a complete candidate-choice question may use quotation marks as
     # presentation. Keep it visible to the usual identity/relationship checks.
     text = outer_quote if quoted_choice else _unquoted(reply)
+    # Ambiguous-reference turns authorize only a complete choice question.
+    # Checking individual sentences would let an otherwise valid question hide
+    # an extra factual assertion behind a pronoun in the following sentence.
+    clarification = outer_quote if outer_quote is not None else reply
+    if candidate_entities and not _candidate_question(clarification, candidate_entities, user_text):
+        issues.append('non_clarification_content')
     if (outer_quote is not None and not quoted_choice
             and any(item.get('name') and item['name'] in outer_quote for item in candidate_entities)):
         issues.append('unattributed_character_quote')
@@ -422,12 +677,21 @@ def validate_reply(reply, subjects, sources, mentioned_entities=(), *, user_text
     names.add(IDENTITY.creator)
     names.discard('')
     names.difference_update(_self_names())
+    if not source_excerpt:
+        if _unsupported_quantity(text, sources, entities.values(), subjects, user_text):
+            issues.append('unsupported_quantity')
+        if _unsupported_pair_denial(text, user_text, subjects, sources):
+            issues.append('unsupported_negative_relation')
+        if _contradicted_personality_origin(text, sources, entities.values(), user_text):
+            issues.append('contradicted_personality_origin')
     act = act or conversation_act(user_text)
     doctor_role = str(user_role).casefold() in ('doctor', '博士')
     if _doctor_address(text) and not doctor_role:
         issues.append('unassigned_user_role:doctor')
     if _social_scolding(text, act):
         issues.append('inappropriate_social_scolding')
+    if _invented_body_state(text, user_text):
+        issues.append('unsupported_body_state')
     if names and re.search(r'(?:^|[。！？!?])\s*(?:' + '|'.join(map(re.escape, names)) + r')\s*[:：]', text):
         issues.append('foreign_speaker_label')
     if any(re.search(r'我(?:就|正)?是\s*' + re.escape(name), text) for name in names):
@@ -447,7 +711,12 @@ def validate_reply(reply, subjects, sources, mentioned_entities=(), *, user_text
                 and not _supported_self_memory('我' + sentence, sources)):
             issues.append('unsupported_self_biography')
         for clause in _clauses(sentence):
+            factual = _factual_voice(clause)
             nonassertive = bool(_NONASSERTIVE_RELATION.search(clause))
+            if (re.search(r'(?:我(?:可以|能|来|会|帮你)|需要我|要我).{0,6}(?:查|找|搜).{0,12}'
+                          r'(?:附近|现场|地图|天气|休息区|餐厅|摊位|票价|人数)', clause)
+                    and not re.search(r'不能|无法|没法|不支持|未接入', clause)):
+                issues.append('unsupported_live_service')
             stage_action = _stage_action(clause)
             if stage_action:
                 issues.append('unsupported_stage_action')
@@ -455,18 +724,29 @@ def validate_reply(reply, subjects, sources, mentioned_entities=(), *, user_text
                 if not nonassertive:
                     issues.append('unsupported_device_experience')
             if re.search(r'(?:我|我们)(?:曾经|以前|当年|小时候|出生|加入了|在.{0,18}(?:长大|研究了|造了)|'
-                         r'(?:还|只)?记得|.{0,5}(?:去过|到过|经历过|见过|遇见过))', clause):
-                if not nonassertive and not _supported_self_memory(clause, sources):
+                         r'(?:还|只)?记得|.{0,5}(?:去过|到过|经历过|见过|遇见过))', factual):
+                if not nonassertive and not _supported_self_memory(factual, sources):
                     issues.append('unsupported_self_biography')
+            if not source_excerpt and _borrowed_self_fact(factual, sources):
+                issues.append('borrowed_character_experience')
             explicit = [entity for entity in others if entity['name'] in clause]
             if explicit:
                 antecedents = explicit
-            if (_SELF_RELATION.search(clause) or _elliptical_acquaintance(clause, subjects)) and not _NONASSERTIVE_RELATION.search(clause):
+            if (not source_excerpt
+                    and (_SELF_RELATION.search(factual) or _elliptical_acquaintance(factual, subjects))
+                    and not _NONASSERTIVE_RELATION.search(clause)
+                    and not _documentary_familiarity(clause)
+                    and not re.search(r'(?:知道|了解|听说过|认识)(?:这个|这一|这个人的)名字', clause)):
                 targets = explicit or antecedents
-                if not _self_relation_supported(clause, targets, sources):
+                if not _self_relation_supported(factual, targets, sources):
                     issues.append('unsupported_personal_acquaintance')
     for sentence in re.split(r'[。！？!?；;]', text):
-        if re.search(r'(?:研发|维护|制造|设计).{0,8}我|我的(?:研发|维护|制造|设计)', sentence):
+        # A self-introduction such as '作为Friston-3的负责人' also reverses
+        # the canon designer / machine relationship, even without '我研发'.
+        if (re.search(r'我.{0,10}(?:负责|主持).{0,8}(?:研发|制造|维护).{0,6}(?:终端|Friston-3)', text, re.I)
+                or re.search(
+                    r'(?:作为|身为|我是)\s*(?:这台)?\s*Friston[-－ ]?3\s*(?:机体)?\s*的?\s*(?:研发)?(?:负责人|设计者|制造者)',
+                    text, re.I)):
             actors = [(sentence.find(name), name) for name in names if name in sentence]
             actor = min(actors)[1] if actors else next(
                 (s['name'] for s in subjects if s['id'] != self_id), '')
@@ -475,24 +755,21 @@ def validate_reply(reply, subjects, sources, mentioned_entities=(), *, user_text
     if re.search(r'我.{0,10}(?:负责|主持).{0,8}(?:研发|制造|维护).{0,6}(?:终端|Friston-3)', text, re.I):
         issues.append('reversed_creator_relationship')
 
-    # Bind role words to the nearest named subject (or a single clear referent),
-    # so A's role somewhere in the packet cannot automatically support B's role.
-    role_terms = ('总工程师', '采购部负责人', '主任', '领袖', '主管', '战术指挥官',
-                  '父亲', '母亲', '哥哥', '姐姐', '妹妹', '弟弟', '恋人', '搭档',
-                  '朋友', '导师', '监护人', '学生', '同事', '亲属',
-                  '萨卡兹', '卡特斯', '黎博利', '沃尔珀', '卡兹戴尔', '莱茵生命', '小兔子')
-    target = primary[0] if len(primary) == 1 else None
+    # Database entities bound which people a source discusses. This is an
+    # entity-coverage check, not proof of every proposition involving them.
     for sentence in re.split(r'[。！？!?；;]', text):
         if not sentence.strip():
             continue
         qualified = bool(_QUALIFIED.search(sentence))
         sentence_sources = [s for s in sources if _usable_source(s, qualified=qualified)]
         support = _support_text(sentence_sources)
-        if uncertain and not usable and not qualified:
+        supported_ids = {s.get(key) for s in sentence_sources
+                         for key in ('subject_id', 'object_id') if s.get(key)}
+        if not source_excerpt and uncertain and not usable and not qualified:
             issues.append('unqualified_uncertain_evidence')
         # An uncertain sentence's qualification must not license a separate,
         # unqualified assertion elsewhere in the reply.
-        for entity in mentioned_entities:
+        for entity in (() if source_excerpt else mentioned_entities):
             if entity['id'] == self_id or entity['name'] not in sentence:
                 continue
             if _name_only_utterance(sentence, entity['name']):
@@ -502,22 +779,10 @@ def validate_reply(reply, subjects, sources, mentioned_entities=(), *, user_text
                 continue
             if doctor_role and entity['name'] == '博士' and _doctor_address(sentence):
                 continue
-            if (entity['name'] not in support and not (
+            if (entity['id'] not in supported_ids and entity['name'] not in support and not (
                     any(subject['id'] == entity['id'] for subject in subjects)
                     and _NONASSERTIVE_RELATION.search(sentence))):
                 issues.append('unsupported_named_entity:' + entity['name'])
-        for clause in _clauses(sentence):
-            hits = [(clause.rfind(s['name']), s) for s in subjects if s['name'] in clause]
-            if hits:
-                target = max(hits, key=lambda pair: pair[0])[1]
-            elif re.match(r'我(?:是|的职业是|担任)', clause):
-                target = {'id': self_id}
-            owned = '\n'.join(s.get('text', '') for s in sentence_sources
-                              if target and (s.get('subject_id') == target['id']
-                                             or s.get('object_id') == target['id']))
-            for term in role_terms:
-                if term in clause and term not in owned and not _NONASSERTIVE_RELATION.search(clause):
-                    issues.append('unsupported_role_or_relation:' + term)
     # Unattributed first-person quotation must not become the NPC's own voice.
     if not quoted_choice and re.search(r'[“「『"][^”」』"]*(?:我|您)[^”」』"]*[”」』"]', reply):
         quotes = re.findall(r'[“「『"]([^”」』"]*(?:我|您)[^”」』"]*)[”」』"]', reply)
@@ -525,5 +790,3 @@ def validate_reply(reply, subjects, sources, mentioned_entities=(), *, user_text
         if not own_quote and not any(name in text for name in names):
             issues.append('unattributed_character_quote')
     return list(dict.fromkeys(issues))
-
-

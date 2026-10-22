@@ -42,7 +42,8 @@ class MemoryStore:
         return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
     def log_turn(self, user_text, reply):
-        with closing(sqlite3.connect(str(self.path))) as db, db:
+        # An audit write must not hold a visitor's reply behind another writer.
+        with closing(sqlite3.connect(str(self.path), timeout=0.1)) as db, db:
             db.executemany(
                 "INSERT INTO conversations(session_id,role,content,created_at) VALUES(?,?,?,?)",
                 [(self.session_id, role, content, self._now())
@@ -95,7 +96,7 @@ class MemoryStore:
     def recall(self, user_text, limit=3, *, include_execution=True):
         terms = self._terms(user_text)
         general = any(word in user_text for word in ("记得我", "关于我的", "记住了什么", "我说过什么"))
-        with closing(sqlite3.connect(str(self.path))) as db:
+        with closing(sqlite3.connect(str(self.path), timeout=0.1)) as db:
             rows = db.execute("SELECT statement,created_at FROM user_memories ORDER BY id DESC LIMIT 500").fetchall()
             scored = [(len(terms & self._terms(statement)), index, statement, timestamp)
                       for index, (statement, timestamp) in enumerate(rows)]

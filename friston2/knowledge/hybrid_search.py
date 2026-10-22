@@ -17,6 +17,7 @@ from friston2.knowledge.entity_resolver import resolve_entity_resolution
 from friston2.knowledge.lore_text import normalize, tokenize
 from friston2.knowledge.retrieve_lore import (
     detect_intent, ranked_search, _subject_names, _mentioned_subjects, _PERSON_KINDS,
+    _requested_categories, _event_scope_context, _event_scoped_item,
 )
 from friston2.knowledge.semantic_index import search as semantic_search
 from friston2.knowledge.terra_kb import connect
@@ -65,8 +66,13 @@ def hybrid_ranked_search(db, question, *, ids=(), limit=8, kinds=None):
     limit = max(1, min(30, int(limit)))
     lexical = ranked_search(db, question, ids=ids,
                             limit=max(SPARSE_CANDIDATES, limit), kinds=kinds)
-    intent = detect_intent(question)
-    print(f"[HybridRAG] intent={intent}, entities={ids}")
+    if ids:
+        slots = ','.join('?' for _ in ids)
+        entities = {row['id']: dict(row) for row in db.execute(
+            f'SELECT id,name,kind FROM entities WHERE id IN ({slots})', ids)}
+    else:
+        entities = {}
+    intent = detect_intent(question, entities.values())
 
     # A known person's introduction already has a high-confidence owner card.
     # Only a real profile can short-circuit retrieval. Reference-only faction
@@ -74,7 +80,11 @@ def hybrid_ranked_search(db, question, *, ids=(), limit=8, kinds=None):
     has_profiles = bool(ids) and all(db.execute(
         "SELECT 1 FROM entities WHERE id=? AND coverage!='reference_only'", (entity_id,)
     ).fetchone() for entity_id in ids)
-    skip_dense = ((intent == 'introduction' and has_profiles)
+    categories = _requested_categories(question, intent)
+    direct_facet = (categories[0] == 'ability' and has_profiles and all(
+        any(row['ref_id'] == entity_id and row['category'] == 'ability' for row in lexical)
+        for entity_id in ids))
+    skip_dense = ((intent == 'introduction' and has_profiles) or direct_facet
                   or (ids == [IDENTITY.entity_id] and intent == 'personality'))
     if skip_dense:
         return _diversified(lexical, limit, ids)
@@ -83,19 +93,17 @@ def hybrid_ranked_search(db, question, *, ids=(), limit=8, kinds=None):
         # Honor the exact SQLite DB supplied by the caller, not a different
         # default DB whose passage IDs might coincidentally overlap.
         active_db_file = db.execute('PRAGMA database_list').fetchone()[2]
-        dense_hits = semantic_search(question, top_k=DENSE_CANDIDATES,
+        missing_names = [entity['name'] for entity in entities.values()
+                         if normalize(entity['name']) not in normalize(question)]
+        semantic_query = ('、'.join(missing_names) + '：' if missing_names else '') + question
+        dense_hits = semantic_search(semantic_query, top_k=DENSE_CANDIDATES,
                                      db_file=Path(active_db_file))
     except (FileNotFoundError, OSError, RuntimeError, ValueError) as exc:
         print(f'[HybridRAG] 语义索引不可用；安全退回原检索：{exc}')
         return _diversified(lexical, limit, ids)
 
-    if ids:
-        slots = ','.join('?' for _ in ids)
-        entities = {row['id']: dict(row) for row in db.execute(
-            f'SELECT id,name,kind FROM entities WHERE id IN ({slots})', ids)}
-    else:
-        entities = {}
     labels = _subject_names(db, ids)
+    event_scope = _event_scope_context(db, question, list(entities.values()))
     person_focus = bool(entities) and all(e['kind'] in _PERSON_KINDS for e in entities.values())
     allow = set(kinds) if kinds is not None else None
 
@@ -118,11 +126,15 @@ def hybrid_ranked_search(db, question, *, ids=(), limit=8, kinds=None):
         row = by_id.get(passage_id)
         if row is None or row['category'] == 'relationship':
             continue
+        row = _event_scoped_item(row, event_scope)
+        if row is None:
+            continue
         if allow is not None and row['kind'] not in allow:
             continue
         owner = row['ref_id'] in ids
-        mentioned = _mentioned_subjects(row, labels)
-        if person_focus and intent in ('introduction', 'personality') and not owner:
+        mentioned = _mentioned_subjects(row, labels) | set(row.get('_event_scope_ids', []))
+        if (person_focus and (intent in ('introduction', 'personality') or categories[0] == 'ability')
+                and not owner):
             continue
         if ids and not mentioned:
             continue
@@ -182,8 +194,12 @@ def hybrid_ranked_search(db, question, *, ids=(), limit=8, kinds=None):
         item['score'] = item['fusion_score']
         fused.append(item)
     fused.sort(key=lambda row: (-row['fusion_score'], row['id']))
-    output = _diversified(fused, limit, ids)
-    print(f'[HybridRAG] 词法候选={len(lexical)}，有效向量候选={len(dense)}，融合输出={len(output)}')
+    # Two weak overlapping channels must not bury a strong source-owned
+    # lexical answer. Reserve one owner anchor; semantic results add context.
+    anchors = [next((row for row in lexical if row['ref_id'] == entity_id), None)
+               for entity_id in ids]
+    anchors = [row for row in anchors if row is not None]
+    output = _diversified(anchors + fused, limit, ids)
     return output
 
 

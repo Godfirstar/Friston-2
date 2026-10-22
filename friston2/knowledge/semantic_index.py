@@ -1,4 +1,4 @@
-"""Friston-3 第一阶段：独立中文语义索引（尚不接入 NPC 的正式回答）。
+"""为 NPC 混合检索提供中文语义索引，同时保留独立构建与查询 CLI。
 
 用法：
     python -m friston2.knowledge.semantic_index build
@@ -117,12 +117,19 @@ def _read_index(path_string: str, mtime_ns: int, file_size: int):
         )
 
 
+@lru_cache(maxsize=2)
+def _snapshot_signature(path_string: str, mtime_ns: int, file_size: int):
+    """Hash each immutable database snapshot once, not once per conversation."""
+    return _signature(Path(path_string))
+
+
 def search(question: str, top_k: int = 5, db_file: Path = KNOWLEDGE_DB,
            index_path: Path = INDEX_PATH):
     db_file, index_path = Path(db_file), Path(index_path)
     if not index_path.is_file():
         raise FileNotFoundError("语义索引不存在，请先运行 python -m friston2.knowledge.semantic_index build")
-    current = _signature(db_file)
+    db_stat = db_file.stat()
+    current = _snapshot_signature(str(db_file.resolve()), db_stat.st_mtime_ns, db_stat.st_size)
     stat = index_path.stat()
 
     passage_ids, matrix, db_sha256, model_name = _read_index(

@@ -10,6 +10,7 @@ from friston3.npc.agentic_rag import (
     AgenticSettings, ROUTE_SCHEMA, ROUTE_TOKENS, _unique_object,
     build_route_input, normalize_entity_choices, parse_decision, route_schema_for_signals,
 )
+from friston3.npc.persona import normalize_presentation
 
 
 class LLMPlanner:
@@ -117,8 +118,13 @@ class LLMPlanner:
             raw = result["message"]["content"]
             call = json.loads(raw, object_pairs_hook=_unique_object)
             self.last_call["parsed_plan"] = deepcopy(call)
-            if not isinstance(call, dict) or set(call) != set(schema["required"]):
+            expected = set(schema["required"])
+            if (not isinstance(call, dict) or set(call) - expected
+                    or expected - set(call) - {"presentation"}):
                 raise ValueError("planner fields do not match the schema")
+            # Performance is advisory. A missing field must not break an
+            # otherwise valid legacy plan, nor become an extra device action.
+            call["presentation"] = normalize_presentation(call.get("presentation"))
             skill, arguments = call["skill"], call["arguments"]
             if not isinstance(skill, str) or type(arguments) is not dict:
                 raise ValueError("invalid skill/argument types")

@@ -31,7 +31,9 @@ def serve() -> None:
     except Exception as exc:
         emit({"event": "fatal", "error": f"{type(exc).__name__}: {exc}"})
         return
-    emit({"event": "ready", "model_load_s": round(time.perf_counter() - start, 3)})
+    emit({"event": "ready", "model_load_s": round(time.perf_counter() - start, 3),
+          "backend": voice.backend, "speaker": voice.speaker, "style": voice.style,
+          "bilingual": voice.bilingual, "warning": voice.warning})
 
     for raw in sys.stdin.buffer:
         if not raw.strip():
@@ -51,7 +53,9 @@ def serve() -> None:
                 raise ValueError("Reply must contain between 1 and 500 characters")
             out_dir = Path(request["output_dir"])
             out_dir.mkdir(parents=True, exist_ok=True)
-            segment_chars = max(25, min(72, int(os.getenv("FRISTON_TTS_SEGMENT_CHARS", "72"))))
+            segment_chars = max(25, min(72, int(os.getenv("FRISTON_TTS_SEGMENT_CHARS", "48"))))
+            # Normalize names using the full language context before chunking.
+            source = voice.prepare_text(source)
             parts = split_text(source, limit=segment_chars)
             if not parts:
                 raise ValueError("No text after normalization")

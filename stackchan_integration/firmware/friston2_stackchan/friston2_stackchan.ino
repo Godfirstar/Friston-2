@@ -1,6 +1,6 @@
 // Friston-3 x StackChan K151 / LCD MODULE E | camera + microphone + v4 audio
 // Board: M5CoreS3 | USB CDC On Boot: Enabled | M5GFX >= 0.2.27
-// Libraries: M5Unified, M5Stack-Avatar (Avatar.h)
+// Libraries: M5Unified, M5GFX, StackChan-BSP (M5StackChan.h).
 // The v0.3 PING / INFO / FACE commands remain compatible.
 // v0.4 additions:
 //   VOLUME 0..160                -> OK VOLUME <number>
@@ -20,20 +20,29 @@
 // v0.6: official StackChan-BSP servo motion commands (MOVE/HOME/STOP).
 // Camera owns the internal I2C bus until CAMERA CLOSE; microphone/audio commands
 // close it automatically before using M5 hardware.
+// v0.7: large block faces. FACE mood survives audio playback; the mouth is
+// an audio overlay. LISTENING / PROUD / SURPRISED extend the existing names.
+// GESTURE NOD|SHAKE|TILT|LOOK_LEFT|LOOK_RIGHT|NONE starts a bounded, nonblocking
+// shoulder gesture. Neutral is (0,450), in tenths of a degree. No boot motion.
+// v1.1: password-protected local Wi-Fi AP, TCP 192.168.4.1:8765. The same
+// line/binary protocol works over USB or TCP, with one command owner at a time.
+// No Internet, external router, cloud service, or association-triggered motion.
 
 #include <Arduino.h>
-#include <Avatar.h>
+#include <M5GFX.h>
 #include <M5Unified.h>
 #include <M5StackChan.h>
+#include <WiFi.h>
+#include <esp_arduino_version.h>
+#include <lwip/sockets.h>
+#include <errno.h>
+#include "friston3_wifi_config.h"
 #include <esp_camera.h>
 #include <esp_heap_caps.h>
 #include <img_converters.h>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
-
-using m5avatar::Avatar;
-using m5avatar::Expression;
 
 namespace {
 
@@ -65,26 +74,138 @@ char lineBuffer[kLineMax] = {};
 size_t lineUsed = 0;
 bool lineTooLong = false;
 
-Avatar avatar;
+WiFiServer commandServer(FRISTON_WIFI_PORT);
+WiFiClient commandClient;
+bool wifiReady = false;
+bool tcpOwner = false;
+bool transportLost = false;
+bool commandActive = false;
+uint32_t lastLinkCheckAt = 0;
+uint32_t lastUsbActivityAt = 0;
+constexpr uint32_t kNetworkWriteTimeoutMs = 1500;
+constexpr uint32_t kUsbClaimQuietMs = 1200;
+
+void markTransportLost();
+bool checkTransportLink(bool force = false);
+void serviceTransport(bool allowClaim);
+void reclaimTransport();
+
+// Print/Stream preserve the protocol's exact bytes. No debug text is sent
+// through this wrapper; only the current owner's responses enter the stream.
+class ProtocolStream : public Stream {
+ public:
+  int available() override {
+    if (!checkTransportLink()) return 0;
+    return tcpOwner ? commandClient.available() : Serial.available();
+  }
+
+  int read() override {
+    if (!checkTransportLink()) return -1;
+    const int value = tcpOwner ? commandClient.read() : Serial.read();
+    if (!tcpOwner && value >= 0) lastUsbActivityAt = millis();
+    return value;
+  }
+
+  int peek() override {
+    if (!checkTransportLink()) return -1;
+    return tcpOwner ? commandClient.peek() : Serial.peek();
+  }
+
+  void flush() override {
+    // TCP sends below already enqueue all bytes or invalidate the session.
+    // WiFiClient.flush() has changed RX/TX semantics between Arduino versions.
+    if (!tcpOwner && !transportLost) Serial.flush();
+  }
+
+  size_t readBytes(char* buffer, size_t length) {
+    if (!checkTransportLink()) return 0;
+    if (!tcpOwner) {
+      const size_t n = Serial.readBytes(buffer, length);
+      if (n != 0) lastUsbActivityAt = millis();
+      return n;
+    }
+    size_t total = 0;
+    const uint32_t started = millis();
+    while (total < length && millis() - started < getTimeout()) {
+      if (!checkTransportLink()) break;
+      const int ready = commandClient.available();
+      if (ready > 0) {
+        const size_t count = (length - total < static_cast<size_t>(ready))
+            ? length - total : static_cast<size_t>(ready);
+        const int n = commandClient.read(reinterpret_cast<uint8_t*>(buffer + total), count);
+        if (n > 0) total += static_cast<size_t>(n);
+        else delay(1);
+      } else {
+        delay(1);
+      }
+    }
+    return total;
+  }
+
+  size_t write(uint8_t value) override { return write(&value, 1); }
+
+  size_t write(const uint8_t* data, size_t count) override {
+    if (!checkTransportLink()) return 0;
+    if (!tcpOwner) return Serial.write(data, count);
+    size_t sent = 0;
+    const uint32_t started = millis();
+    while (sent < count) {
+      if (!checkTransportLink()) break;
+      // Nonblocking BSD send avoids WiFiClient's version-dependent long retry
+      // loop. ACKs and each <=1024-byte block are completed or the link closes.
+      const int n = ::send(commandClient.fd(), data + sent, count - sent, MSG_DONTWAIT);
+      if (n > 0) {
+        sent += static_cast<size_t>(n);
+        continue;
+      }
+      if (n == 0 || (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) ||
+          millis() - started >= kNetworkWriteTimeoutMs) {
+        markTransportLost();
+        break;
+      }
+      delay(1);
+    }
+    return sent;
+  }
+
+  using Print::write;
+};
+
+ProtocolStream protocol;
+
+M5Canvas faceCanvas(&M5.Display);
+bool faceCanvasReady = false;
+bool faceDirty = true;
+uint32_t lastFaceAt = 0;
+uint32_t nextBlinkAt = 3500;
+uint32_t blinkUntil = 0;
+bool wasBlinking = false;
 bool speakerReady = false;
 uint8_t speakerVolume = 80;
 bool cameraReady = false;
 bool cameraOwnsBus = false;
 unsigned cameraWidth = 0;
 uint32_t lastCameraAt = 0;
+uint32_t lastCameraRestoreAttemptAt = 0;
 constexpr uint32_t kCameraIdleMs = 10000;
+constexpr uint32_t kCameraRestoreRetryMs = 1000;
 constexpr uint32_t kDataAckTimeoutMs = 3000;
 constexpr uint32_t kDataTotalTimeoutMs = 20000;
 constexpr size_t kMaxJpegBytes = 300000;
 
 void animateMouth();
+void drawBlockFace();
+void tickGesture();
+void cancelGesture();
+void clearPcm();
 bool closeCamera();
 bool ensureSpeaker();
 struct ControlLine;
 bool micCancelRequested(ControlLine& reader);
 
 enum class FaceMode : uint8_t {
-  Idle, Thinking, Speaking, Happy, Neutral, Doubt, Sad, Angry, Sleepy
+  Idle, Thinking, Speaking, Happy, Neutral, Doubt, Sad, Angry, Sleepy,
+  Listening, Proud, Surprised
 };
 
 struct FaceEntry { const char* key; FaceMode value; };
@@ -94,6 +215,8 @@ constexpr FaceEntry kFaces[] = {
     {"NEUTRAL", FaceMode::Neutral}, {"DOUBT", FaceMode::Doubt},
     {"SAD", FaceMode::Sad}, {"ANGRY", FaceMode::Angry},
     {"SLEEPY", FaceMode::Sleepy},
+    {"LISTENING", FaceMode::Listening}, {"PROUD", FaceMode::Proud},
+    {"SURPRISED", FaceMode::Surprised},
 };
 
 FaceMode currentFace = FaceMode::Idle;
@@ -121,34 +244,340 @@ bool pcmPlaying = false;
 uint32_t playbackStartAt = 0;
 uint32_t playbackDurationMs = 0;
 
+struct GestureFrame { int16_t x; int16_t y; uint16_t holdMs; };
+constexpr GestureFrame kNod[] = {{0, 490, 300}, {0, 410, 450}, {0, 450, 350}};
+constexpr GestureFrame kShake[] = {{-60, 450, 350}, {60, 450, 600}, {0, 450, 350}};
+constexpr GestureFrame kTilt[] = {{45, 430, 500}, {0, 450, 400}};
+constexpr GestureFrame kLookLeft[] = {{-80, 450, 650}, {0, 450, 500}};
+constexpr GestureFrame kLookRight[] = {{80, 450, 650}, {0, 450, 500}};
+const GestureFrame* gestureFrames = nullptr;
+size_t gestureCount = 0;
+size_t gestureIndex = 0;
+uint32_t nextGestureAt = 0;
+
+void cancelGesture() {
+  if (gestureFrames == nullptr) return;
+  gestureFrames = nullptr;
+  gestureCount = gestureIndex = 0;
+  // Stop at the present pose, without sending another target toward a face,
+  // shoulder, or camera view. A subsequent explicit gesture has finite limits.
+  M5StackChan.Motion.stop();
+}
+
+void tickGesture() {
+  if (gestureFrames == nullptr) return;
+  if (cameraOwnsBus) { cancelGesture(); return; }
+  const uint32_t now = millis();
+  if (static_cast<int32_t>(now - nextGestureAt) < 0) return;
+  if (gestureIndex >= gestureCount) {
+    gestureFrames = nullptr;
+    gestureCount = gestureIndex = 0;
+    return;
+  }
+  const GestureFrame& step = gestureFrames[gestureIndex++];
+  // Preserve the v3 torque fix: establish a fresh target before enabling.
+  M5StackChan.Motion.setAutoTorqueReleaseEnabled(false);
+  M5StackChan.Motion.move(step.x, step.y, 200);
+  M5StackChan.Motion.setTorqueEnabled(true);
+  M5StackChan.Motion.setAutoTorqueReleaseEnabled(true);
+  nextGestureAt = now + step.holdMs;
+}
+
+void startGesture(const char* name) {
+  cancelGesture();
+  if (strcmp(name, "NONE") == 0) {
+    protocol.println("OK GESTURE NONE");
+    return;
+  }
+  if (cameraOwnsBus) { protocol.println("ERR GESTURE_CAMERA_BUSY"); return; }
+  const GestureFrame* frames = nullptr;
+  size_t count = 0;
+  if (strcmp(name, "NOD") == 0) { frames = kNod; count = 3; }
+  else if (strcmp(name, "SHAKE") == 0) { frames = kShake; count = 3; }
+  else if (strcmp(name, "TILT") == 0) { frames = kTilt; count = 2; }
+  else if (strcmp(name, "LOOK_LEFT") == 0) { frames = kLookLeft; count = 2; }
+  else if (strcmp(name, "LOOK_RIGHT") == 0) { frames = kLookRight; count = 2; }
+  else { protocol.println("ERR UNKNOWN_GESTURE"); return; }
+  gestureFrames = frames;
+  gestureCount = count;
+  gestureIndex = 0;
+  nextGestureAt = millis();
+  tickGesture();
+  protocol.print("OK GESTURE ");
+  protocol.println(name);
+}
+
+void markTransportLost() {
+  if (!tcpOwner || transportLost) return;
+  transportLost = true;
+  commandClient.stop();  // Discard every buffered byte from the old session.
+  cancelGesture();
+  // BSP Motion.stop reads servo positions over UART 6/7, not camera SCCB 12/11.
+  M5StackChan.Motion.stop();
+  // Speaker owns pcmBuffer until its asynchronous queue has stopped. Leave
+  // allocation cleanup to reclaimTransport(), outside the current command.
+  if (pcmPlaying) M5.Speaker.stop();
+  lineUsed = 0;
+  lineTooLong = false;
+}
+
+bool checkTransportLink(bool force) {
+  if (transportLost) return false;
+  if (!tcpOwner) return true;
+  const uint32_t now = millis();
+  if (!force && now - lastLinkCheckAt < 30) return true;
+  lastLinkCheckAt = now;
+  if (WiFi.softAPgetStationNum() == 0 || !commandClient.connected()) {
+    markTransportLost();
+    return false;
+  }
+  // A half-closed peer is a lost session for this duplex protocol. Do not
+  // execute commands cached by WiFiClient after the socket has reached EOF.
+  uint8_t probe = 0;
+  const int result = ::recv(commandClient.fd(), &probe, 1, MSG_PEEK | MSG_DONTWAIT);
+  if (result == 0 || (result < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
+    markTransportLost();
+    return false;
+  }
+  return true;
+}
+
+void reclaimTransport() {
+  if (!transportLost || commandActive) return;
+  if (pcmPlaying || M5.Speaker.isPlaying()) {
+    M5.Speaker.stop();
+    if (M5.Speaker.isPlaying()) return;
+  }
+  pcmPlaying = false;
+  clearPcm();
+  if (!closeCamera()) {
+    // Leave cameraOwnsBus set: no new TCP owner or M5 I2C operation can start.
+    // The loop retries restoration; USB can still issue CAMERA CLOSE/reset.
+    Serial.println("WARN I2C_RESTORE_RETRY USB_AVAILABLE");
+  }
+  if (!cameraOwnsBus) M5.Mic.end();
+  smoothedMouth = 0.0f;
+  faceDirty = true;
+  lineUsed = 0;
+  lineTooLong = false;
+  memset(lineBuffer, 0, sizeof(lineBuffer));
+  // USB bytes received while TCP held ownership are never replayed afterward.
+  while (Serial.available() > 0) Serial.read();
+  tcpOwner = false;
+  transportLost = false;
+  // No new USB command has arrived, so a fresh TCP handshake need not wait
+  // for the USB quiet window again after the old operation has fully stopped.
+  lastUsbActivityAt = millis() - kUsbClaimQuietMs;
+}
+
+void serviceTransport(bool allowClaim) {
+  checkTransportLink(true);
+  if (transportLost) {
+    reclaimTransport();
+    return;
+  }
+  if (tcpOwner) {
+    // USB remains physically available for flashing, but cannot inject bytes
+    // into the TCP owner's line or binary transaction.
+    while (Serial.available() > 0) Serial.read();
+  }
+  if (!wifiReady) return;
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  WiFiClient incoming = commandServer.accept();
+#else
+  WiFiClient incoming = commandServer.available();
+#endif
+  if (!incoming) return;
+  const bool usbQuiet = millis() - lastUsbActivityAt >= kUsbClaimQuietMs;
+  const bool busy = !allowClaim || tcpOwner || commandActive || pcmReceiving ||
+                    pcmPlaying || cameraOwnsBus || gestureFrames != nullptr ||
+                    lineUsed != 0 || lineTooLong || Serial.available() != 0 || !usbQuiet;
+  if (busy) {
+    static const char response[] = "ERR TRANSPORT_BUSY\n";
+    ::send(incoming.fd(), response, sizeof(response) - 1, MSG_DONTWAIT);
+    incoming.stop();
+    return;
+  }
+  while (Serial.available() > 0) Serial.read();
+  lineUsed = 0;
+  lineTooLong = false;
+  memset(lineBuffer, 0, sizeof(lineBuffer));
+  // A previous USB MOVE may still be interpolating after its short reply.
+  // Ownership change cancels that target; it never creates a new pose target.
+  cancelGesture();
+  M5StackChan.Motion.stop();
+  commandClient = incoming;
+  commandClient.setNoDelay(true);
+  // Detect an unreachable host/link without a permanent stale owner. A hung
+  // userspace process whose OS still ACKs is not detectable by TCP keepalive.
+  // Normal idle dialogue has a live TCP stack; keepalives never move servos.
+  const int one = 1, idleSeconds = 3, intervalSeconds = 1, probeCount = 3;
+  setsockopt(commandClient.fd(), SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
+#ifdef TCP_KEEPIDLE
+  setsockopt(commandClient.fd(), IPPROTO_TCP, TCP_KEEPIDLE, &idleSeconds, sizeof(idleSeconds));
+  setsockopt(commandClient.fd(), IPPROTO_TCP, TCP_KEEPINTVL, &intervalSeconds, sizeof(intervalSeconds));
+  setsockopt(commandClient.fd(), IPPROTO_TCP, TCP_KEEPCNT, &probeCount, sizeof(probeCount));
+#endif
+  tcpOwner = true;
+  lastLinkCheckAt = 0;
+  protocol.println("READY FRISTON3_STACKCHAN_TCP");
+}
+
+void startWireless() {
+#if FRISTON_WIFI_ENABLED
+  const size_t passwordLength = strlen(FRISTON_WIFI_PASSWORD);
+  if (passwordLength < 8 || passwordLength > 63 || strlen(FRISTON_WIFI_SSID) == 0 ||
+      strlen(FRISTON_WIFI_SSID) > 32) {
+    Serial.println("WARN WIFI_CONFIG_INVALID USB_AVAILABLE");
+    return;
+  }
+  const IPAddress address(192, 168, 4, 1), netmask(255, 255, 255, 0);
+  WiFi.persistent(false);
+  if (!WiFi.mode(WIFI_AP) || !WiFi.softAPConfig(address, address, netmask) ||
+      !WiFi.softAP(FRISTON_WIFI_SSID, FRISTON_WIFI_PASSWORD,
+                   FRISTON_WIFI_CHANNEL, 0, 1)) {
+    WiFi.mode(WIFI_OFF);
+    Serial.println("WARN WIFI_AP_FAILED USB_AVAILABLE");
+    return;
+  }
+  WiFi.setSleep(false);
+  commandServer.begin();
+  commandServer.setNoDelay(true);
+  wifiReady = true;
+  // USB-only startup diagnostic, not interleaved with binary responses.
+  Serial.printf("READY WIFI_AP %s 192.168.4.1 %u\n", FRISTON_WIFI_SSID,
+                static_cast<unsigned>(FRISTON_WIFI_PORT));
+#endif
+}
+
 void setFace(FaceMode next) {
   currentFace = next;
   smoothedMouth = 0.0f;
   lipStep = 0;
-  avatar.setMouthOpenRatio(0.0f);
-  switch (next) {
-    case FaceMode::Idle:
-    case FaceMode::Speaking:
-    case FaceMode::Happy:
-      avatar.setExpression(Expression::Happy);
-      break;
-    case FaceMode::Thinking:
-    case FaceMode::Doubt:
-      avatar.setExpression(Expression::Doubt);
-      break;
-    case FaceMode::Neutral:
-      avatar.setExpression(Expression::Neutral);
-      break;
-    case FaceMode::Sad:
-      avatar.setExpression(Expression::Sad);
-      break;
-    case FaceMode::Angry:
-      avatar.setExpression(Expression::Angry);
-      break;
-    case FaceMode::Sleepy:
-      avatar.setExpression(Expression::Sleepy);
-      break;
+  faceDirty = true;
+  // Paint once immediately, including before a blocking microphone capture.
+  drawBlockFace();
+}
+
+// A face is rendered by the command task only. The former Avatar draw task
+// must not run alongside this renderer and race for the display. An 8-bit
+// offscreen canvas uses about 75 KiB at 320x240 and avoids visible clearing.
+// If allocation fails, direct drawing keeps the device usable.
+void drawBlockFace() {
+  if (pcmReceiving) return;  // Preserve tight ACK timing during audio upload.
+  const uint32_t now = millis();
+  if (!faceDirty && now - lastFaceAt < kLipRefreshMs) return;
+  lastFaceAt = now;
+
+  const bool blinkAllowed = currentFace != FaceMode::Sleepy &&
+                            currentFace != FaceMode::Surprised;
+  if (blinkAllowed && static_cast<int32_t>(now - nextBlinkAt) >= 0) {
+    blinkUntil = now + 130;
+    nextBlinkAt = now + 3200 + (now % 1700);
   }
+  const bool blinking = blinkAllowed && blinkUntil != 0 &&
+                         static_cast<int32_t>(blinkUntil - now) > 0;
+  const bool animated = pcmPlaying || currentFace == FaceMode::Speaking ||
+                        currentFace == FaceMode::Thinking ||
+                        currentFace == FaceMode::Listening;
+  if (!faceDirty && !animated && blinking == wasBlinking) return;
+  faceDirty = false;
+  wasBlinking = blinking;
+
+  lgfx::LGFXBase& screen = faceCanvasReady
+      ? static_cast<lgfx::LGFXBase&>(faceCanvas)
+      : static_cast<lgfx::LGFXBase&>(M5.Display);
+  const int w = M5.Display.width();
+  const int h = M5.Display.height();
+  // Coordinates below use a 320x240 design grid; scale to the actual panel.
+  const auto sx = [w](int x) { return x * w / 320; };
+  const auto sy = [h](int y) { return y * h / 240; };
+  const uint16_t black = 0x0000;
+  const uint16_t cyan = 0x5FFF;
+  const uint16_t amber = 0xFEA8;
+  const uint16_t softBlue = 0x7DFF;
+  uint16_t ink = cyan;
+  if (currentFace == FaceMode::Thinking || currentFace == FaceMode::Doubt ||
+      currentFace == FaceMode::Proud) ink = amber;
+  if (currentFace == FaceMode::Sad || currentFace == FaceMode::Sleepy) ink = softBlue;
+  if (currentFace == FaceMode::Angry) ink = 0xFC88;
+  screen.fillScreen(black);
+
+  int leftY = 70, rightY = 70, leftH = 78, rightH = 78;
+  int gaze = 0;
+  switch (currentFace) {
+    case FaceMode::Neutral: leftY = rightY = 82; leftH = rightH = 58; break;
+    case FaceMode::Thinking:
+      leftY = 68; leftH = 74; rightY = 96; rightH = 38;
+      gaze = ((now / 700) % 2) ? 7 : -7;
+      break;
+    case FaceMode::Doubt: leftY = 62; leftH = 86; rightY = 103; rightH = 34; break;
+    case FaceMode::Proud: leftY = 90; leftH = 43; rightY = 80; rightH = 58; break;
+    case FaceMode::Sleepy: leftY = rightY = 120; leftH = rightH = 14; break;
+    case FaceMode::Surprised: leftY = rightY = 52; leftH = rightH = 100; break;
+    case FaceMode::Listening: leftY = rightY = 60; leftH = rightH = 92; break;
+    default: break;
+  }
+  if (blinking) { leftY = rightY = 112; leftH = rightH = 12; }
+
+  const int leftX = 38 + gaze, rightX = 184 + gaze;
+  screen.fillRoundRect(sx(leftX), sy(leftY), sx(98), sy(leftH), sx(12), ink);
+  screen.fillRoundRect(sx(rightX), sy(rightY), sx(98), sy(rightH), sx(12), ink);
+  if (!blinking) {
+    if (currentFace == FaceMode::Happy) {
+      // Thick upside-down U's: visibly pleased without tiny pupils.
+      screen.fillRoundRect(sx(leftX + 15), sy(104), sx(68), sy(68), sx(14), black);
+      screen.fillRoundRect(sx(rightX + 15), sy(104), sx(68), sy(68), sx(14), black);
+    } else if (currentFace == FaceMode::Angry) {
+      screen.fillTriangle(sx(leftX), sy(68), sx(leftX + 99), sy(68),
+                          sx(leftX + 99), sy(108), black);
+      screen.fillTriangle(sx(rightX), sy(68), sx(rightX + 99), sy(68),
+                          sx(rightX), sy(108), black);
+    } else if (currentFace == FaceMode::Sad) {
+      screen.fillTriangle(sx(leftX), sy(68), sx(leftX + 99), sy(68),
+                          sx(leftX), sy(108), black);
+      screen.fillTriangle(sx(rightX), sy(68), sx(rightX + 99), sy(68),
+                          sx(rightX + 99), sy(108), black);
+    }
+  }
+
+  if (pcmPlaying || currentFace == FaceMode::Speaking) {
+    // Five wide segments respond to the PCM amplitude, never to random text.
+    const int fullHeight = 10 + static_cast<int>(smoothedMouth * 36.0f);
+    for (int i = 0; i < 5; ++i) {
+      const int distance = i > 2 ? i - 2 : 2 - i;
+      const int barH = fullHeight - distance * (fullHeight / 6);
+      screen.fillRoundRect(sx(102 + i * 24), sy(190 - barH / 2),
+                           sx(18), sy(barH), sx(3), ink);
+    }
+  } else if (currentFace == FaceMode::Thinking) {
+    const int active = (now / 360) % 3;
+    for (int i = 0; i < 3; ++i) {
+      screen.fillRoundRect(sx(111 + i * 36), sy(i == active ? 178 : 185),
+                           sx(26), sy(i == active ? 22 : 14), sx(4), ink);
+    }
+  } else if (currentFace == FaceMode::Surprised) {
+    screen.fillRoundRect(sx(136), sy(172), sx(48), sy(40), sx(10), ink);
+    screen.fillRoundRect(sx(149), sy(183), sx(22), sy(18), sx(4), black);
+  } else if (currentFace == FaceMode::Happy) {
+    screen.fillRoundRect(sx(110), sy(178), sx(100), sy(30), sx(12), ink);
+    screen.fillRect(sx(122), sy(176), sx(76), sy(15), black);
+  } else if (currentFace == FaceMode::Proud) {
+    screen.fillRoundRect(sx(108), sy(187), sx(94), sy(13), sx(4), ink);
+    screen.fillRoundRect(sx(191), sy(177), sx(16), sy(23), sx(4), ink);
+  } else if (currentFace == FaceMode::Sad) {
+    screen.fillRoundRect(sx(111), sy(179), sx(98), sy(28), sx(10), ink);
+    screen.fillRect(sx(124), sy(193), sx(72), sy(18), black);
+  } else {
+    screen.fillRoundRect(sx(111), sy(183), sx(98), sy(13), sx(4), ink);
+  }
+  if (currentFace == FaceMode::Listening) {
+    // A large, slow breathing pair of side marks is visible while waiting.
+    const int markH = 24 + static_cast<int>((now / 240) % 3) * 8;
+    screen.fillRoundRect(sx(10), sy(109 - markH / 2), sx(13), sy(markH), sx(3), ink);
+    screen.fillRoundRect(sx(297), sy(109 - markH / 2), sx(13), sy(markH), sx(3), ink);
+  }
+  if (faceCanvasReady) faceCanvas.pushSprite(0, 0);
 }
 
 // Only the command-handling task touches the shared internal I2C bus. Camera
@@ -161,6 +590,7 @@ bool closeCamera() {
     cameraWidth = 0;
   }
   if (cameraOwnsBus) {
+    lastCameraRestoreAttemptAt = millis();
     if (!M5.In_I2C.begin()) return false;
     cameraOwnsBus = false;
   }
@@ -176,9 +606,12 @@ bool ensureSpeaker() {
 }
 
 void serviceUi() {
-  // Motion has its own FreeRTOS update task. This updates M5 and touch only.
+  // BSP interpolates servo positions in its own task. This task schedules
+  // finite targets and draws the face; camera ownership still gates M5 I2C.
   if (!cameraOwnsBus) M5StackChan.update();
+  tickGesture();
   animateMouth();
+  drawBlockFace();
 }
 
 struct ControlLine {
@@ -220,8 +653,10 @@ int waitDataControl(const char* expected, uint32_t transferStarted) {
   const uint32_t started = millis();
   while (millis() - started < kDataAckTimeoutMs &&
          millis() - transferStarted < kDataTotalTimeoutMs) {
-    while (Serial.available() > 0) {
-      const int ready = reader.put(static_cast<char>(Serial.read()));
+    serviceTransport(false);
+    if (transportLost) return -1;
+    while (protocol.available() > 0) {
+      const int ready = reader.put(static_cast<char>(protocol.read()));
       if (!ready) continue;
       if (ready < 0) return -2;
       if (strcmp(reader.text, "CANCEL") == 0) return -1;
@@ -237,8 +672,9 @@ int waitDataControl(const char* expected, uint32_t transferStarted) {
 
 bool sendData(const char* format, const uint8_t* data, size_t count,
               unsigned first, unsigned second) {
+  if (!checkTransportLink(true)) return false;
   const uint32_t crc = dataCrc32(data, count);
-  Serial.printf("DATA %s %lu %08lx %u %u\n", format,
+  protocol.printf("DATA %s %lu %08lx %u %u\n", format,
                 static_cast<unsigned long>(count),
                 static_cast<unsigned long>(crc), first, second);
   const uint32_t started = millis();
@@ -249,11 +685,13 @@ bool sendData(const char* format, const uint8_t* data, size_t count,
                              ? count - sent : kFastAckBytes;
     size_t written = 0;
     while (written < block) {
+      serviceTransport(false);
+      if (transportLost) { response = -1; break; }
       if (millis() - started >= kDataTotalTimeoutMs) {
         response = 0;
         break;
       }
-      const size_t n = Serial.write(data + sent + written, block - written);
+      const size_t n = protocol.write(data + sent + written, block - written);
       written += n;
       if (n == 0) delay(1);
     }
@@ -264,26 +702,27 @@ bool sendData(const char* format, const uint8_t* data, size_t count,
     response = waitDataControl(expected, started);
   }
   if (response == 1 && sent == count) {
-    Serial.println("DONE DATA");
+    protocol.println("DONE DATA");
     return true;
   }
-  Serial.println(response == -1 ? "ERR DATA_CANCELLED" :
+  protocol.println(response == -1 ? "ERR DATA_CANCELLED" :
                  response == -2 ? "ERR DATA_ACK" : "ERR DATA_TIMEOUT");
   return false;
 }
 
 bool openCamera(unsigned width) {
+  cancelGesture();
   // RGB565 DMA has a fixed expected frame byte count. Reconfigure the entire
   // driver on a resolution change; set_framesize alone is insufficient.
   if ((cameraReady && cameraWidth != width) || (!cameraReady && cameraOwnsBus)) {
     if (!closeCamera()) {
-      Serial.println("ERR I2C_RESTORE");
+      protocol.println("ERR I2C_RESTORE");
       return false;
     }
   }
   if (!cameraReady) {
     if (!psramFound()) {
-      Serial.println("ERR CAMERA_PSRAM");
+      protocol.println("ERR CAMERA_PSRAM");
       return false;
     }
     M5.Mic.end();
@@ -323,7 +762,7 @@ bool openCamera(unsigned width) {
     const esp_err_t err = esp_camera_init(&cfg);
     if (err != ESP_OK) {
       closeCamera();
-      Serial.printf("ERR CAMERA_INIT 0x%lx\n", static_cast<unsigned long>(err));
+      protocol.printf("ERR CAMERA_INIT 0x%lx\n", static_cast<unsigned long>(err));
       return false;
     }
     cameraReady = true;
@@ -332,7 +771,7 @@ bool openCamera(unsigned width) {
   sensor_t* sensor = esp_camera_sensor_get();
   if (sensor == nullptr) {
     closeCamera();
-    Serial.println("ERR CAMERA_SIZE");
+    protocol.println("ERR CAMERA_SIZE");
     return false;
   }
   cameraWidth = width;
@@ -347,14 +786,14 @@ void captureCamera(unsigned width) {
   camera_fb_t* frame = esp_camera_fb_get();
   if (frame == nullptr) {
     closeCamera();
-    Serial.println("ERR CAMERA_FRAME");
+    protocol.println("ERR CAMERA_FRAME");
     return;
   }
   esp_camera_fb_return(frame);
   frame = esp_camera_fb_get();
   if (frame == nullptr) {
     closeCamera();
-    Serial.println("ERR CAMERA_FRAME");
+    protocol.println("ERR CAMERA_FRAME");
     return;
   }
   uint8_t* jpeg = nullptr;
@@ -366,7 +805,7 @@ void captureCamera(unsigned width) {
   if (!ok || jpeg == nullptr || jpegSize == 0 || jpegSize > kMaxJpegBytes) {
     free(jpeg);
     closeCamera();
-    Serial.println("ERR CAMERA_JPEG");
+    protocol.println("ERR CAMERA_JPEG");
     return;
   }
   const bool sent = sendData("JPEG", jpeg, jpegSize, actualWidth, actualHeight);
@@ -386,13 +825,15 @@ int16_t* const micFrames[3] = {micStartup, micWorking[0], micWorking[1]};
 int16_t micPreRoll[kMicPreRollSamples];
 
 bool micCancelRequested(ControlLine& reader) {
-  while (Serial.available() > 0) {
-    const int ready = reader.put(static_cast<char>(Serial.read()));
+  serviceTransport(false);
+  if (transportLost) return true;
+  while (protocol.available() > 0) {
+    const int ready = reader.put(static_cast<char>(protocol.read()));
     if (!ready) continue;
     if (ready > 0 && strcmp(reader.text, "CANCEL") == 0) return true;
-    if (ready < 0 || reader.text[0] != '\0') Serial.println("ERR MIC_BUSY");
+    if (ready < 0 || reader.text[0] != '\0') protocol.println("ERR MIC_BUSY");
   }
-  return false;
+  return transportLost;
 }
 
 bool touchedNow() {
@@ -421,11 +862,11 @@ void captureMic(const char* args) {
       (strcmp(mode, "TOUCH") != 0 && strcmp(mode, "VAD") != 0) ||
       waitMs < 100 || waitMs > 10000 || maxMs < 1000 || maxMs > 12000 ||
       silenceMs < 200 || silenceMs > 2000 || threshold < 30 || threshold > 10000) {
-    Serial.println("ERR MIC_HEADER");
+    protocol.println("ERR MIC_HEADER");
     return;
   }
   if (!closeCamera()) {
-    Serial.println("ERR I2C_RESTORE");
+    protocol.println("ERR I2C_RESTORE");
     return;
   }
   const bool touchMode = strcmp(mode, "TOUCH") == 0;
@@ -437,24 +878,30 @@ void captureMic(const char* args) {
     bool touched = false;
     while (millis() - waitingSince < waitMs) {
       M5.update();
+      // An empty TOUCH poll is still idle time. Let a muted reply finish its
+      // short gesture instead of cancelling it before the first visible step.
+      tickGesture();
+      drawBlockFace();
       if (micCancelRequested(control)) {
-        Serial.println("MIC CANCELLED");
+        protocol.println("MIC CANCELLED");
         return;
       }
       if (touchedNow()) { touched = true; break; }
       delay(3);
     }
     if (!touched) {
-      Serial.println("MIC EMPTY");
+      protocol.println("MIC EMPTY");
       return;
     }
   }
+  // Actual capture (touch accepted or VAD armed) takes priority over gestures.
+  cancelGesture();
   const size_t maxSamples = (maxMs * kSampleRate) / 1000;
   int16_t* clip = static_cast<int16_t*>(
       heap_caps_malloc(maxSamples * sizeof(int16_t),
                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
   if (clip == nullptr) {
-    Serial.println("ERR MIC_PSRAM");
+    protocol.println("ERR MIC_PSRAM");
     return;
   }
   M5.Speaker.end();
@@ -466,7 +913,7 @@ void captureMic(const char* args) {
     M5.Mic.end();
     heap_caps_free(clip);
     ensureSpeaker();
-    Serial.println("ERR MIC_INIT");
+    protocol.println("ERR MIC_INIT");
     return;
   }
 
@@ -481,7 +928,7 @@ void captureMic(const char* args) {
   const uint32_t began = millis();
   uint32_t recordBegan = 0;
   uint32_t lastVoiceAt = 0;
-  setFace(FaceMode::Neutral);
+  setFace(FaceMode::Listening);
 
   // record() queues an asynchronous capture. A third accepted request means
   // the oldest of these three alternating buffers has been released. Reading
@@ -567,8 +1014,8 @@ void captureMic(const char* args) {
       // click or clap is rejected; more voice is required before sending.
       voicedFrames = touchMode ? (voice ? 1 : 0) : consecutiveVoice;
       lastVoiceEnd = voice ? used : 0;
-      setFace(FaceMode::Neutral);
-      Serial.println("MIC STARTED");
+      setFace(FaceMode::Listening);
+      protocol.println("MIC STARTED");
       continue;
     }
 
@@ -593,13 +1040,13 @@ void captureMic(const char* args) {
   const bool restored = ensureSpeaker();
   setFace(FaceMode::Idle);
   if (cancelled) {
-    Serial.println("MIC CANCELLED");
+    protocol.println("MIC CANCELLED");
   } else if (failed) {
-    Serial.println("ERR MIC_CAPTURE");
+    protocol.println("ERR MIC_CAPTURE");
   } else if (!restored) {
-    Serial.println("ERR SPEAKER_RESTORE");
+    protocol.println("ERR SPEAKER_RESTORE");
   } else if (!recording || voicedFrames < 8 || lastVoiceEnd == 0) {
-    Serial.println("MIC EMPTY");
+    protocol.println("MIC EMPTY");
   } else {
     // Keep 100 ms after the final voiced frame, rather than transferring the
     // entire endpoint-silence timeout and asking ASR to process it again.
@@ -635,25 +1082,33 @@ void finishAudio() {
   // M5.Speaker.isPlaying() is checked by the caller before freeing memory.
   pcmPlaying = false;
   clearPcm();
-  setFace(FaceMode::Idle);
-  Serial.println("AUDIO DONE");
+  smoothedMouth = 0.0f;
+  faceDirty = true;
+  drawBlockFace();
+  protocol.println("AUDIO DONE");
 }
 
 void failAudio(const char* reason) {
   // Called for failed receive or failed playRaw. Do not invoke during playback.
   const size_t received = wireReceived;
   const size_t expected = wireExpected;
+  cancelGesture();
   clearPcm();
-  setFace(FaceMode::Idle);
-  Serial.print("ERR ");
-  Serial.print(reason);
+  smoothedMouth = 0.0f;
+  faceDirty = true;
+  drawBlockFace();
+  protocol.print("ERR ");
+  protocol.print(reason);
   if (strcmp(reason, "AUDIO_RX_TIMEOUT") == 0) {
-    Serial.print(" received=");
-    Serial.print(static_cast<unsigned long>(received));
-    Serial.print(" expected=");
-    Serial.print(static_cast<unsigned long>(expected));
+    protocol.print(" received=");
+    protocol.print(static_cast<unsigned long>(received));
+    protocol.print(" expected=");
+    protocol.print(static_cast<unsigned long>(expected));
   }
-  Serial.println();
+  protocol.println();
+  // A failed binary transfer has no reliable line boundary left. Drop all
+  // remaining TCP bytes instead of allowing them into the command parser.
+  if (tcpOwner) markTransportLost();
 }
 
 // CRC-32 (IEEE, same as zlib.crc32 on Python), streaming update on receipt.
@@ -667,6 +1122,7 @@ void crcUpdate(const uint8_t* data, size_t len) {
 }
 
 void startPlayback() {
+  if (!checkTransportLink(true)) return;
   pcmReceiving = false;
   if ((~crcProgress) != expectedCrc) {
     failAudio("AUDIO_CRC");
@@ -686,12 +1142,13 @@ void startPlayback() {
     failAudio("SPEAKER_QUEUE");
     return;
   }
-  setFace(FaceMode::Speaking);
   pcmPlaying = true;
+  smoothedMouth = 0.0f;
+  faceDirty = true;
   playbackStartAt = millis();
   playbackDurationMs = static_cast<uint32_t>((sampleCount * 1000ULL) / kSampleRate);
   lastLipAt = 0;
-  Serial.println("AUDIO STARTED");
+  protocol.println("AUDIO STARTED");
 }
 
 // Standard IMA ADPCM 4-bit nibble decoder. Reset state for each clip.
@@ -713,7 +1170,9 @@ int16_t decodeAdpcmNibble(uint8_t code) {
 
 void receivePcm() {
   if (!pcmReceiving) return;
-  const int available = Serial.available();
+  if (!checkTransportLink()) return;
+  tickGesture();
+  const int available = protocol.available();
   if (available <= 0) return;
   const size_t remaining = wireExpected - wireReceived;
   const size_t untilAck = ackChunkBytes - (wireReceived % ackChunkBytes);
@@ -724,7 +1183,7 @@ void receivePcm() {
   size_t n = 0;
   if (adpcm4) {
     uint8_t packet[kFastAckBytes];
-    n = Serial.readBytes(reinterpret_cast<char*>(packet), toRead);
+    n = protocol.readBytes(reinterpret_cast<char*>(packet), toRead);
     if (n == 0) return;
     crcUpdate(packet, n);  // CRC checks WIRE bytes, not decoded audio.
     int16_t* samples = reinterpret_cast<int16_t*>(pcmBuffer);
@@ -739,7 +1198,7 @@ void receivePcm() {
     }
     pcmReceived = decodedSamples * sizeof(int16_t);
   } else {
-    n = Serial.readBytes(reinterpret_cast<char*>(pcmBuffer + pcmReceived), toRead);
+    n = protocol.readBytes(reinterpret_cast<char*>(pcmBuffer + pcmReceived), toRead);
     if (n == 0) return;
     crcUpdate(pcmBuffer + pcmReceived, n);
     pcmReceived += n;
@@ -747,8 +1206,8 @@ void receivePcm() {
   wireReceived += n;
   lastRxAt = millis();
   if ((wireReceived % ackChunkBytes) == 0 || wireReceived == wireExpected) {
-    Serial.print("ACK ");
-    Serial.println(static_cast<unsigned long>(wireReceived));
+    protocol.print("ACK ");
+    protocol.println(static_cast<unsigned long>(wireReceived));
   }
   if (wireReceived == wireExpected) {
     if (pcmReceived != pcmExpected) failAudio("AUDIO_DECODE_SIZE");
@@ -758,11 +1217,13 @@ void receivePcm() {
 
 void startReceive(const char* args, bool compressed, bool fast = false) {
   if (pcmReceiving || pcmPlaying) {
-    Serial.println("ERR AUDIO_BUSY");
+    cancelGesture();
+    protocol.println("ERR AUDIO_BUSY");
     return;
   }
-  if (fast && !fastAudioReady) {
-    Serial.println("ERR AUDIO_RX_BUFFER");
+  if (fast && !fastAudioReady && !tcpOwner) {
+    cancelGesture();
+    protocol.println("ERR AUDIO_RX_BUFFER");
     return;
   }
 
@@ -771,19 +1232,22 @@ void startReceive(const char* args, bool compressed, bool fast = false) {
   char* sizeEnd = nullptr;
   const unsigned long count = strtoul(args, &sizeEnd, 10);
   if (sizeEnd == args || *sizeEnd != ' ') {
-    Serial.println("ERR AUDIO_HEADER");
+    cancelGesture();
+    protocol.println("ERR AUDIO_HEADER");
     return;
   }
   const char* crcText = sizeEnd + 1;
   if (strlen(crcText) != 8) {
-    Serial.println("ERR AUDIO_HEADER");
+    cancelGesture();
+    protocol.println("ERR AUDIO_HEADER");
     return;
   }
   for (size_t i = 0; i < 8; ++i) {
     const char ch = crcText[i];
     if (!((ch >= '0' && ch <= '9') || (ch >= 'A' && ch <= 'F') ||
           (ch >= 'a' && ch <= 'f'))) {
-      Serial.println("ERR AUDIO_HEADER");
+      cancelGesture();
+      protocol.println("ERR AUDIO_HEADER");
       return;
     }
   }
@@ -791,11 +1255,13 @@ void startReceive(const char* args, bool compressed, bool fast = false) {
   if (count == 0 ||
       (compressed ? count > kMaxPcmBytes / sizeof(int16_t)
                   : count > kMaxPcmBytes || (count & 1U) != 0)) {
-    Serial.println("ERR AUDIO_SIZE");
+    cancelGesture();
+    protocol.println("ERR AUDIO_SIZE");
     return;
   }
   if (!ensureSpeaker()) {
-    Serial.println("ERR SPEAKER_UNAVAILABLE");
+    cancelGesture();
+    protocol.println("ERR SPEAKER_UNAVAILABLE");
     return;
   }
 
@@ -806,7 +1272,8 @@ void startReceive(const char* args, bool compressed, bool fast = false) {
   pcmBuffer = static_cast<uint8_t*>(
       heap_caps_malloc(pcmBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
   if (pcmBuffer == nullptr) {
-    Serial.println("ERR AUDIO_PSRAM");
+    cancelGesture();
+    protocol.println("ERR AUDIO_PSRAM");
     return;
   }
   pcmExpected = pcmBytes;
@@ -822,18 +1289,20 @@ void startReceive(const char* args, bool compressed, bool fast = false) {
   crcProgress = 0xFFFFFFFFU;
   pcmReceiving = true;
   lastRxAt = millis();
-  Serial.println("READY AUDIO");
+  protocol.println("READY AUDIO");
 }
 
 void handleLine(const char* line) {
   if (strcmp(line, "PING") == 0) {
-    Serial.println("PONG");
+    protocol.println("PONG");
     return;
   }
   if (strcmp(line, "INFO") == 0) {
-    Serial.println(fastAudioReady
-        ? "INFO FRISTON2_STACKCHAN_V4_AUDIO_PCM16_16K_ACK128_ADPCM4_ACK1024 CAMERA_JPEG_V1 MIC_PCM16_V1 SERVO_MOTION_V1 SERVO_TORQUE_FIX_V3"
-        : "INFO FRISTON2_STACKCHAN_V4_AUDIO_PCM16_16K_ACK128_ADPCM4 CAMERA_JPEG_V1 MIC_PCM16_V1 SERVO_MOTION_V1 SERVO_TORQUE_FIX_V3");
+    protocol.print((fastAudioReady || tcpOwner)
+        ? "INFO FRISTON2_STACKCHAN_V4_AUDIO_PCM16_16K_ACK128_ADPCM4_ACK1024 CAMERA_JPEG_V1 MIC_PCM16_V1 SERVO_MOTION_V1 SERVO_TORQUE_FIX_V3 BLOCK_FACE_V1 FACE_AUDIO_HOLD_V1 GESTURE_V1"
+        : "INFO FRISTON2_STACKCHAN_V4_AUDIO_PCM16_16K_ACK128_ADPCM4 CAMERA_JPEG_V1 MIC_PCM16_V1 SERVO_MOTION_V1 SERVO_TORQUE_FIX_V3 BLOCK_FACE_V1 FACE_AUDIO_HOLD_V1 GESTURE_V1");
+    if (wifiReady) protocol.print(" WIFI_TCP_V1");
+    protocol.println();
     return;
   }
   if (strncmp(line, "AUDIO4B ", 8) == 0) {
@@ -848,17 +1317,31 @@ void handleLine(const char* line) {
     startReceive(line + 6, false);
     return;
   }
+  // STOP is available during playback and never frees the speaker's buffer.
+  if (strcmp(line, "STOP") == 0) {
+    cancelGesture();
+    if (cameraOwnsBus && !closeCamera()) { protocol.println("ERR I2C_RESTORE"); return; }
+    M5StackChan.Motion.stop();
+    protocol.println("OK STOP");
+    return;
+  }
+  if (strncmp(line, "GESTURE ", 8) == 0) {
+    startGesture(line + 8);
+    return;
+  }
+  if (strcmp(line, "HOME") == 0 || strncmp(line, "MOVE ", 5) == 0 ||
+      strcmp(line, "CANCEL") == 0) cancelGesture();
   if (pcmPlaying) {
-    Serial.println("ERR AUDIO_BUSY");
+    protocol.println("ERR AUDIO_BUSY");
     return;
   }
   if (strcmp(line, "CANCEL") == 0) {
     closeCamera();
-    Serial.println("OK CANCEL");
+    protocol.println("OK CANCEL");
     return;
   }
   if (strcmp(line, "HOME") == 0) {
-    if (cameraOwnsBus && !closeCamera()) { Serial.println("ERR I2C_RESTORE"); return; }
+    if (cameraOwnsBus && !closeCamera()) { protocol.println("ERR I2C_RESTORE"); return; }
     // BSP Servo::init() disables torque. Moving the animation target alone
     // does not enable it. Suppress auto-release during target/torque setup,
     // then restore the BSP's normal idle release behavior.
@@ -866,24 +1349,18 @@ void handleLine(const char* line) {
     M5StackChan.Motion.goHome(200);
     M5StackChan.Motion.setTorqueEnabled(true);
     M5StackChan.Motion.setAutoTorqueReleaseEnabled(true);
-    Serial.println("OK HOME");
-    return;
-  }
-  if (strcmp(line, "STOP") == 0) {
-    if (cameraOwnsBus && !closeCamera()) { Serial.println("ERR I2C_RESTORE"); return; }
-    M5StackChan.Motion.stop();
-    Serial.println("OK STOP");
+    protocol.println("OK HOME");
     return;
   }
   if (strncmp(line, "MOVE ", 5) == 0) {
-    if (cameraOwnsBus && !closeCamera()) { Serial.println("ERR I2C_RESTORE"); return; }
+    if (cameraOwnsBus && !closeCamera()) { protocol.println("ERR I2C_RESTORE"); return; }
     long x = 0, y = 0, speed = 300;
     char extra = 0;
     const int fields = sscanf(line + 5, "%ld %ld %ld %c", &x, &y, &speed, &extra);
     // StackChan BSP uses tenths of degrees. Keep Y away from mechanical stops.
     if (fields != 3 || x < -900 || x > 900 || y < 50 || y > 850 ||
         speed < 100 || speed > 800) {
-      Serial.println("ERR MOVE_RANGE");
+      protocol.println("ERR MOVE_RANGE");
       return;
     }
     // Atomically set both targets through Motion's mutex. Do not energize
@@ -893,17 +1370,17 @@ void handleLine(const char* line) {
                            static_cast<int>(speed));
     M5StackChan.Motion.setTorqueEnabled(true);
     M5StackChan.Motion.setAutoTorqueReleaseEnabled(true);
-    Serial.printf("OK MOVE %ld %ld %ld\n", x, y, speed);
+    protocol.printf("OK MOVE %ld %ld %ld\n", x, y, speed);
     return;
   }
   if (strcmp(line, "CAMERA CLOSE") == 0) {
-    Serial.println(closeCamera() ? "OK CAMERA CLOSE" : "ERR I2C_RESTORE");
+    protocol.println(closeCamera() ? "OK CAMERA CLOSE" : "ERR I2C_RESTORE");
     return;
   }
   if (strncmp(line, "CAMERA ", 7) == 0) {
     if (strcmp(line + 7, "320") == 0) captureCamera(320);
     else if (strcmp(line + 7, "640") == 0) captureCamera(640);
-    else Serial.println("ERR CAMERA_SIZE");
+    else protocol.println("ERR CAMERA_SIZE");
     return;
   }
   if (strncmp(line, "MIC ", 4) == 0) {
@@ -914,15 +1391,15 @@ void handleLine(const char* line) {
     char* end = nullptr;
     unsigned long level = strtoul(line + 7, &end, 10);
     if (end == line + 7 || *end != '\0' || level > 160) {
-      Serial.println("ERR VOLUME_RANGE");
+      protocol.println("ERR VOLUME_RANGE");
       return;
     }
     // Retain volume across Mic/Speaker I2S handovers. No codec/I2C access is
     // needed here while the camera owns the bus; AUDIO restores the speaker.
     speakerVolume = static_cast<uint8_t>(level);
     if (speakerReady && !cameraOwnsBus) M5.Speaker.setVolume(speakerVolume);
-    Serial.print("OK VOLUME ");
-    Serial.println(level);
+    protocol.print("OK VOLUME ");
+    protocol.println(level);
     return;
   }
   if (strncmp(line, "FACE ", 5) == 0) {
@@ -930,34 +1407,40 @@ void handleLine(const char* line) {
     for (const auto& entry : kFaces) {
       if (strcmp(requested, entry.key) == 0) {
         if (currentFace != entry.value) setFace(entry.value);
-        Serial.print("OK FACE ");
-        Serial.println(entry.key);
+        protocol.print("OK FACE ");
+        protocol.println(entry.key);
         return;
       }
     }
-    Serial.println("ERR UNKNOWN_FACE");
+    protocol.println("ERR UNKNOWN_FACE");
     return;
   }
-  Serial.println("ERR UNKNOWN_COMMAND");
+  protocol.println("ERR UNKNOWN_COMMAND");
 }
 
-void pollSerial() {
-  while (Serial.available() > 0) {
+void pollProtocol() {
+  if (transportLost) return;
+  while (protocol.available() > 0) {
     if (pcmReceiving) {
       receivePcm();
       continue;
     }
-    const char ch = static_cast<char>(Serial.read());
+    const int next = protocol.read();
+    if (next < 0) return;
+    const char ch = static_cast<char>(next);
     if (ch == '\r') continue;
     if (ch == '\n') {
       if (lineTooLong) {
-        Serial.println("ERR LINE_TOO_LONG");
+        protocol.println("ERR LINE_TOO_LONG");
       } else if (lineUsed > 0) {
         lineBuffer[lineUsed] = '\0';
+        commandActive = true;
         handleLine(lineBuffer);
+        commandActive = false;
       }
       lineUsed = 0;
       lineTooLong = false;
+      if (transportLost) return;
       continue;
     }
     if (lineTooLong) continue;
@@ -967,7 +1450,7 @@ void pollSerial() {
 }
 
 void animateMouth() {
-  if (currentFace != FaceMode::Speaking) return;
+  if (!pcmPlaying && currentFace != FaceMode::Speaking) return;
   const uint32_t now = millis();
   if (now - lastLipAt < kLipRefreshMs) return;
   lastLipAt = now;
@@ -991,16 +1474,16 @@ void animateMouth() {
     if (target > 0.86f) target = 0.86f;
     if (target < 0.10f) target = 0.02f;
     smoothedMouth = 0.38f * target + 0.62f * smoothedMouth;
-    avatar.setMouthOpenRatio(smoothedMouth);
   } else {
     // Preserve v0.3's manual FACE SPEAKING animation.
     const float seq[] = {0.12f, 0.60f, 0.88f, 0.27f, 0.75f, 0.18f};
-    avatar.setMouthOpenRatio(seq[lipStep]);
+    smoothedMouth = seq[lipStep];
     lipStep = (lipStep + 1) % (sizeof(seq) / sizeof(seq[0]));
   }
 }
 
 void pollAudioState() {
+  if (transportLost) return;  // Disconnect cleanup alone owns the PCM buffer.
   if (pcmReceiving && (millis() - lastRxAt) > kRxTimeoutMs) {
     failAudio("AUDIO_RX_TIMEOUT");
   }
@@ -1031,27 +1514,36 @@ void setup() {
   Serial.setTimeout(30);
   Serial.setTxTimeoutMs(200);
   Serial.setDebugOutput(false);
+  protocol.setTimeout(30);
 #if ARDUINO_USB_MODE && ARDUINO_USB_CDC_ON_BOOT
   if (Serial.setTxBufferSize(4096) < 4096) Serial.setTxBufferSize(256);
 #endif
   speakerReady = M5.Speaker.begin();
   if (speakerReady) M5.Speaker.setVolume(speakerVolume);
-  avatar.init(1);
-  avatar.setIsAutoBlink(true);
-  avatar.setSpeechText("");
+  faceCanvas.setColorDepth(8);
+  faceCanvasReady = faceCanvas.createSprite(M5.Display.width(), M5.Display.height()) != nullptr;
   setFace(FaceMode::Idle);
-  // Do not move on boot or serial reconnect. Motion starts only on HOME/MOVE.
+  // Do not move on boot or serial reconnect. Motion starts on HOME/MOVE/GESTURE.
   // BSP initializes torque OFF; command handlers explicitly enable it.
   M5StackChan.Motion.setAutoTorqueReleaseEnabled(true);
   Serial.println("READY FRISTON2_STACKCHAN_AUDIO");
   if (!speakerReady) Serial.println("WARN SPEAKER_INIT_FAILED");
+  if (!faceCanvasReady) Serial.println("WARN FACE_CANVAS_DIRECT_DRAW");
+  startWireless();
 }
 
 void loop() {
+  serviceTransport(true);
   serviceUi();
-  pollSerial();
+  pollProtocol();
   pollAudioState();
   animateMouth();
   if (cameraReady && millis() - lastCameraAt > kCameraIdleMs) closeCamera();
+  if (cameraOwnsBus && !cameraReady &&
+      millis() - lastCameraRestoreAttemptAt >= kCameraRestoreRetryMs) {
+    // Transient I2C restoration failure must not strand TCP behind its busy
+    // gate forever. Each attempt is separated; USB recovery stays available.
+    closeCamera();
+  }
   delay(3);
 }

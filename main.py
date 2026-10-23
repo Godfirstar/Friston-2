@@ -23,7 +23,7 @@ def main():
     arguments = _arguments()
     face = camera = speech_input = owner = None
     try:
-        # Setup/status paths return before creating COM workers or chat models.
+        # Setup/status paths return before creating device workers or chat models.
         if arguments.download_owner_models:
             from friston3.owner_setup import download_owner_models
             prepared = download_owner_models(arguments.download_owner_models)
@@ -44,7 +44,7 @@ def main():
         from friston3.hardware.camera import create_camera
         from stackchan_integration import StackChanFaceEvents
 
-        # Camera, microphone, expressions and playback share one COM owner.
+        # Camera, microphone, expressions and playback share one USB/TCP owner.
         face = StackChanFaceEvents()
         camera = create_camera(face)
         owner = OwnerIdentityManager(camera=camera, device=face)
@@ -57,6 +57,9 @@ def main():
         source_label = "栈酱摄像头" if CAMERA_SOURCE == "stackchan" else "电脑摄像头"
         input_label = "栈酱麦克风" if INPUT_MODE == "stackchan" else "键盘输入"
         print(f"{IDENTITY.name} 启动（{source_label} / {input_label}）")
+        if face.enabled:
+            link_label = "本地 Wi-Fi" if face.transport == "tcp" else "USB"
+            print(f"[StackChan] {link_label}：{face.port}")
         owner.warmup()
         if INPUT_MODE == "stackchan":
             from stackchan_integration.voice_input import StackChanSpeechInput
@@ -177,6 +180,7 @@ def _run_session(face, camera, speech_input, owner):
     print("  /owner status：查看身份状态；/owner enroll face|voice|both：录入主人")
     print("  /owner mode auto|owner|visitor|once：自动、主人演示、访客、下一句主人")
     print("  /owner forget：删除身份模板；/visitor new：开始新访客会话")
+    print("  /voice off | on | status：电脑控制台静音、恢复播音或查看状态")
     print("  退出：在电脑控制台或由已确认的主人结束程序")
     if speech_input is not None:
         print("  等待说话时按 Ctrl+C 进入电脑控制台；控制台空行返回麦克风。")
@@ -203,6 +207,17 @@ def _run_session(face, camera, speech_input, owner):
                 continue
 
             if input_source == "text":
+                if command.split()[:1] == ["/voice"]:
+                    _discard_input(owner, speech_input)
+                    parts = command.split()
+                    if len(parts) == 2 and parts[1] in ("off", "on"):
+                        voice.set_enabled(parts[1] == "on")
+                        print("[StackChanTTS] " + ("已恢复播音。" if voice.enabled else "已静音；文字、表情和动作继续。"))
+                    elif len(parts) == 2 and parts[1] == "status":
+                        print(f"[StackChanTTS] {'启用' if voice.enabled else '静音'}；音量={voice.volume}")
+                    else:
+                        print("用法：/voice off | /voice on | /voice status")
+                    continue
                 # The physical console can inspect the actual previous result
                 # without replacing a visitor's trace with a new owner turn.
                 if command in ("查看证据", "/evidence"):
@@ -277,10 +292,12 @@ def _run_session(face, camera, speech_input, owner):
                     # path, success flag and execution record without changes.
                     reply_text = "可露希尔，" + reply_text
                 print(f"{IDENTITY.name}:", reply_text)
+                face.prepare_reply(result)
                 if (result.get("success", True) and executed == "npc_talk"
                         and not is_memory_command(instruction)):
                     voice.speak(reply_text)
-                # MOTION_LINK_V1: once per completed task, after full playback.
+                # Speech consumes the gesture just before the first clip.
+                # A muted/unavailable voice still gets one bounded gesture.
                 face.on_task_completed(result)
             finally:
                 face.on_reply_ready()

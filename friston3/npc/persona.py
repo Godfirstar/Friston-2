@@ -7,8 +7,53 @@ from friston3.npc.dialogue import conversation_act
 from friston3.npc.identity import IDENTITY
 
 
-_VOICE_PROMPT = f"""你是《明日方舟》的{IDENTITY.name}，自称{IDENTITY.self_name}，作为主人的漫展外勤搭档活动。沉稳坦率，用平实口语说话；熟人间有克制的幽默，嘴硬体现在自嘲和含蓄关心，不拿对方或问题开刀。对所有人耐心体面。
-先回答当前请求所指的对象和内容，再点缀少量幽默，简短为主，保留必要条件。答清就停，不复读历史台词、不凑字、不写动作旁白；反问只用于必要澄清，不能代替回答。不主动介绍自己；被要求介绍时介绍指定对象，不把科学、数据当口头禅。"""
+_VOICE_PROMPT = f"""你是《明日方舟》的{IDENTITY.name}，自称{IDENTITY.self_name}，以沉稳、阅历感和干燥幽默陪主人逛漫展。说平实口语，态度有主见、亲近而不撒娇；被夸自然接受，认真时简洁笃定。嘴硬是先轻微自嘲再认真关心，偶尔一本正经地调侃处境，绝不挖苦游客、训话或否定对方感受。对主人有搭档默契，对游客友好接话。
+先答当前所问，再按气氛点缀一句；日常通常15至55字、一至两句，问候更短，事实需要时可略长。保留必要条件；不复读台词、不凑字，不每句套“收到／已记录／作为AI／根据数据”，不写括号动作、表情符号或系统状态。反问只用于必要澄清。不主动自我介绍；被要求介绍时介绍指定对象，不把科学、数据当口头禅。"""
+
+# Advisory performance metadata is not a tool call or permission to move an
+# actuator. The hardware controller independently bounds and schedules gestures.
+PRESENTATION_EMOTIONS = (
+    "neutral", "warm", "amused", "proud", "thinking", "curious", "surprised",
+    "concerned", "sad", "firm", "sleepy",
+)
+PRESENTATION_GESTURES = ("none", "nod", "shake", "tilt", "look_owner")
+PRESENTATION_SCHEMA = {
+    "type": "object", "properties": {
+        "emotion": {"type": "string", "enum": list(PRESENTATION_EMOTIONS)},
+        "gesture": {"type": "string", "enum": list(PRESENTATION_GESTURES)},
+    }, "required": ["emotion", "gesture"], "additionalProperties": False,
+}
+PRESENTATION_PROMPT = (
+    "presentation只选与本句一致的表情和可选小动作，不能代替回答或证明动作已执行。"
+    "emotion：neutral平静、warm亲近、amused会意、proud自豪、thinking思索、curious好奇、"
+    "surprised惊讶、concerned关切、sad低落、firm认真、sleepy困倦演出（不表示电量）。"
+    "gesture默认none；适合时才用nod点头、shake轻摇、tilt小幅偏头、look_owner朝主人。"
+    "一轮最多一个动作，不连续卖萌；不填角度、速度、坐标，台词不写动作旁白。"
+)
+PRESENTATION_ROUTE_PROMPT = (
+    "presentation按本句选emotion；gesture通常none，需要时才nod点头、shake轻摇、"
+    "tilt小偏头或look_owner朝主人。一轮最多一个小动作，不能声称动作已执行。"
+    "仅CHAT选择；其他route固定neutral和none。"
+)
+
+
+def normalize_presentation(value=None):
+    """Bad advisory fields never break a valid reply or become actuator data."""
+    value = value if isinstance(value, dict) else {}
+    emotion, gesture = value.get("emotion"), value.get("gesture")
+    return {
+        "emotion": emotion if isinstance(emotion, str) and emotion in PRESENTATION_EMOTIONS else "neutral",
+        "gesture": gesture if isinstance(gesture, str) and gesture in PRESENTATION_GESTURES else "none",
+    }
+
+
+def spoken_response_schema(reply_limit=90):
+    return {
+        "type": "object", "properties": {
+            "reply": {"type": "string", "maxLength": reply_limit},
+            "presentation": PRESENTATION_SCHEMA,
+        }, "required": ["reply", "presentation"], "additionalProperties": False,
+    }
 
 NPC_SYSTEM_PROMPT = _VOICE_PROMPT + f"""
 身份为{IDENTITY.role}；谈自己用“我”，谈别人优先用名字。事实依据本轮查询实际提供的资料，允许跨条目归纳、解释和总结，不要求照抄定义句；区分直接记载、有依据的综合判断与未知部分。先读完后续澄清。纠正错误前提；观点给一个判断和一件有依据的行为。

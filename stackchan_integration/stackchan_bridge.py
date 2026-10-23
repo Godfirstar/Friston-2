@@ -1,15 +1,16 @@
-"""Friston-3 <-> StackChan K151 USB bridge.
+"""Friston-3 <-> StackChan K151 USB or offline Wi-Fi TCP bridge.
 
 Negotiate ADPCM4/ACK1024 for fast uploads; retain ACK128/PCM16 compatibility.
 Every clip is CRC-checked by the device before playback. Sensor downloads
 use bounded, CRC-checked DATA frames on this same connection. This module
-never starts a second serial reader; call it through StackChanFaceEvents.
-Only one process may own COM10.
+never starts a second reader; call it through StackChanFaceEvents.
+Only one process/transport may own the device at a time.
 """
 
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import os
 import sys
 import threading
@@ -17,8 +18,14 @@ import time
 import zlib
 from array import array
 from typing import Optional
+from urllib.parse import urlsplit
 
-import serial
+try:
+    import serial
+except ImportError:
+    serial = None  # TCP transport uses only the Python standard library.
+
+from .tcp_transport import TcpByteStream
 
 
 # Canonical IMA ADPCM step and index tables. Reset predictor/index each clip.
@@ -87,17 +94,53 @@ def _encode_ima_adpcm(pcm16le: bytes) -> bytes:
 
 
 class StackChanBridge:
-    """Control an Arduino-flashed StackChan over its USB CDC serial port."""
+    """Run the same bounded device protocol over USB CDC or a local TCP link."""
 
     VALID_FACES = frozenset({
         "idle", "thinking", "speaking", "happy", "neutral", "doubt",
-        "sad", "angry", "sleepy",
+        "sad", "angry", "sleepy", "listening", "proud", "surprised",
+    })
+    VALID_GESTURES = frozenset({
+        "none", "nod", "shake", "tilt", "look_left", "look_right",
     })
 
-    def __init__(self, port: Optional[str] = None, baudrate: int = 115200):
-        self.port = port or os.getenv("FRISTON_STACKCHAN_PORT", "COM10")
+    def __init__(self, port: Optional[str] = None, baudrate: int = 115200, *,
+                 transport: Optional[str] = None, host: Optional[str] = None,
+                 tcp_port: Optional[int] = None):
+        selected = str(transport or os.getenv("FRISTON_STACKCHAN_TRANSPORT", "serial")).strip().lower()
+        endpoint = str(port or os.getenv("FRISTON_STACKCHAN_PORT", "COM10")).strip()
+        if endpoint.lower().startswith("tcp://"):
+            parsed = urlsplit(endpoint)
+            if (not parsed.hostname or parsed.username is not None or parsed.password is not None
+                    or parsed.path not in ("", "/") or parsed.query or parsed.fragment):
+                raise ValueError("Use tcp://IP:PORT without credentials, path or query")
+            if transport is not None and selected != "tcp":
+                raise ValueError("A tcp:// endpoint requires TCP transport")
+            host = parsed.hostname
+            tcp_port = parsed.port if parsed.port is not None else 8765
+            selected = "tcp"
+        if selected not in ("serial", "tcp"):
+            raise ValueError("FRISTON_STACKCHAN_TRANSPORT must be serial or tcp")
+        self.transport = selected
+        self.host = str(host or os.getenv("FRISTON_STACKCHAN_HOST", "192.168.4.1")).strip()
+        if selected == "tcp":
+            try:
+                self.host = str(ipaddress.ip_address(self.host))
+            except ValueError as exc:
+                raise ValueError("FRISTON_STACKCHAN_HOST must be a numeric IP, e.g. 192.168.4.1") from exc
+        try:
+            raw_tcp_port = tcp_port if tcp_port is not None else (
+                os.getenv("FRISTON_STACKCHAN_TCP_PORT", "8765") if selected == "tcp" else "8765"
+            )
+            self.tcp_port = int(raw_tcp_port)
+        except (ValueError, TypeError) as exc:
+            raise ValueError("FRISTON_STACKCHAN_TCP_PORT must be an integer") from exc
+        if not 1 <= self.tcp_port <= 65535:
+            raise ValueError("FRISTON_STACKCHAN_TCP_PORT must be in 1..65535")
+        tcp_host = f"[{self.host}]" if ":" in self.host else self.host
+        self.port = f"tcp://{tcp_host}:{self.tcp_port}" if selected == "tcp" else endpoint
         self.baudrate = baudrate
-        self._serial: Optional[serial.Serial] = None
+        self._serial = None  # serial.Serial or TcpByteStream; one reader owns it.
         self._firmware_info: Optional[str] = None
         self.last_audio_timing: dict[str, float | str] = {}
         self.last_camera_timing: dict[str, float | int] = {}
@@ -117,14 +160,25 @@ class StackChanBridge:
             raise TimeoutError("StackChan operation deadline exceeded")
 
     def _write_bytes(self, data: bytes) -> None:
-        self._check_active()
-        if self._serial is None or not self._serial.is_open:
-            raise RuntimeError("StackChan not connected")
-        sent = self._serial.write(data)
-        if sent != len(data):
-            raise RuntimeError(f"Partial USB write: {sent}/{len(data)}")
-        # No flush() here: it can block indefinitely on a disconnected Windows
-        # COM device. Protocol acknowledgements confirm that data was received.
+        try:
+            self._check_active()
+            if self._serial is None or not self._serial.is_open:
+                raise RuntimeError("StackChan not connected")
+            deadline = time.monotonic() + 1.0
+            sent = 0
+            while sent < len(data):
+                self._check_active()
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"StackChan write timed out after {sent}/{len(data)} bytes")
+                count = self._serial.write(data[sent:])
+                if not isinstance(count, int) or count <= 0:
+                    raise ConnectionError(f"StackChan write stopped after {sent}/{len(data)} bytes")
+                sent += count
+            # Protocol ACKs confirm receipt; flush() may block on broken USB.
+        except Exception:
+            if self.transport == "tcp":
+                self.close()
+            raise
 
     def _send_line(self, command: str) -> None:
         if (not command.isascii() or len(command) > 160
@@ -133,37 +187,54 @@ class StackChanBridge:
         self._write_bytes((command + "\n").encode("ascii"))
 
     def _read_line(self, deadline: float) -> str:
-        """Read a whole bounded line even if a USB read times out halfway."""
-        if self._serial is None or not self._serial.is_open:
-            raise RuntimeError("StackChan not connected")
-        line = bytearray()
-        while time.monotonic() < deadline:
-            self._check_active()
-            char = self._serial.read(1)
-            if not char:
-                continue
-            if char == b"\n":
-                return bytes(line).decode("ascii", errors="replace").strip()
-            line.extend(char)
-            if len(line) > 256:
-                raise RuntimeError("StackChan protocol line exceeds 256 bytes")
-        raise TimeoutError(f"StackChan response timed out on {self.port}")
+        """Read one whole line; retain fragments across short polling timeouts."""
+        try:
+            if self._serial is None or not self._serial.is_open:
+                raise RuntimeError("StackChan not connected")
+            line = bytearray()
+            while time.monotonic() < deadline:
+                self._check_active()
+                char = self._serial.read(1)
+                if not char:
+                    continue
+                if char == b"\n":
+                    return bytes(line).decode("ascii", errors="replace").strip()
+                line.extend(char)
+                if len(line) > 256:
+                    raise RuntimeError("StackChan protocol line exceeds 256 bytes")
+            raise TimeoutError(f"StackChan response timed out on {self.port}")
+        except Exception:
+            # TCP disconnect resets firmware framing. USB sensor errors still
+            # need _receive_blob's best-effort CANCEL before its port closes.
+            if self.transport == "tcp":
+                self.close()
+            raise
 
     def connect(self) -> "StackChanBridge":
         self._check_active()
         if self._serial is not None and self._serial.is_open:
             return self
+        self._firmware_info = None
         try:
-            self._serial = serial.Serial(
-                self.port, self.baudrate, timeout=0.15, write_timeout=1.0
-            )
-            # Some ESP32 USB CDC configurations reboot when the port opens.
-            # The nominal baudrate is USB CDC line coding, not a UART bitrate.
-            settle_until = time.monotonic() + 1.2
-            while time.monotonic() < settle_until:
-                self._check_active()
-                time.sleep(0.05)
-            self._serial.reset_input_buffer()
+            if self.transport == "tcp":
+                self._serial = TcpByteStream(
+                    self.host, self.tcp_port, timeout=0.15, write_timeout=1.0,
+                    connect_timeout=3.0, check_active=self._check_active,
+                )
+                # TCP opening does not reboot the ESP32. Do not drain a READY
+                # line or any valid protocol bytes as if this were USB startup.
+            else:
+                if serial is None:
+                    raise RuntimeError("USB transport requires: python -m pip install pyserial")
+                self._serial = serial.Serial(
+                    self.port, self.baudrate, timeout=0.15, write_timeout=1.0
+                )
+                # Some ESP32 USB CDC configurations reboot when the port opens.
+                settle_until = time.monotonic() + 1.2
+                while time.monotonic() < settle_until:
+                    self._check_active()
+                    time.sleep(0.05)
+                self._serial.reset_input_buffer()
             self._exchange("PING", "PONG", timeout=5.0)
             return self
         except Exception:
@@ -171,35 +242,46 @@ class StackChanBridge:
             raise
 
     def _read_response(self, command: str, timeout: float = 3.0) -> str:
-        self._send_line(command)
-        deadline = time.monotonic() + timeout
-        recently_seen = []
-        while time.monotonic() < deadline:
-            line = self._read_line(deadline)
-            if not line:
-                continue
-            if line.startswith("ERR "):
-                raise RuntimeError(f"StackChan rejected {command!r}: {line}")
-            if (line == "PONG" or line.startswith("OK FACE ")
-                    or line.startswith("OK VOLUME ") or line.startswith("OK MOVE ")
-                    or line in ("OK HOME", "OK STOP") or line.startswith("INFO ")
-                    or line == "OK CAMERA CLOSE"):
-                return line
-            if len(recently_seen) < 5:
-                recently_seen.append(line)
-        raise TimeoutError(
-            f"No response to {command!r} on {self.port}; "
-            f"check firmware, port ownership and USB CDC. Other output: {recently_seen}"
-        )
+        try:
+            self._send_line(command)
+            deadline = time.monotonic() + timeout
+            recently_seen = []
+            while time.monotonic() < deadline:
+                line = self._read_line(deadline)
+                if not line:
+                    continue
+                if line.startswith("ERR "):
+                    raise RuntimeError(f"StackChan rejected {command!r}: {line}")
+                if (line == "PONG" or line.startswith("OK FACE ")
+                        or line.startswith("OK VOLUME ") or line.startswith("OK MOVE ")
+                        or line.startswith("OK GESTURE ")
+                        or line in ("OK HOME", "OK STOP") or line.startswith("INFO ")
+                        or line == "OK CAMERA CLOSE"):
+                    return line
+                if len(recently_seen) < 5:
+                    recently_seen.append(line)
+            raise TimeoutError(
+                f"No response to {command!r} on {self.port}; "
+                f"check firmware, endpoint and transport ownership. Other output: {recently_seen}"
+            )
+        except Exception:
+            if self.transport == "tcp":
+                self.close()
+            raise
 
     def _exchange(self, command: str, expected: str, timeout: float = 3.0) -> str:
-        received = self._read_response(command, timeout=timeout)
-        if received != expected:
-            raise RuntimeError(
-                f"Unexpected response to {command!r}: expected {expected!r}, "
-                f"received {received!r}"
-            )
-        return received
+        try:
+            received = self._read_response(command, timeout=timeout)
+            if received != expected:
+                raise RuntimeError(
+                    f"Unexpected response to {command!r}: expected {expected!r}, "
+                    f"received {received!r}"
+                )
+            return received
+        except Exception:
+            if self.transport == "tcp":
+                self.close()
+            raise
 
     def ping(self) -> bool:
         self._exchange("PING", "PONG")
@@ -218,8 +300,22 @@ class StackChanBridge:
     def set_face(self, face: str) -> None:
         if not isinstance(face, str) or face.lower() not in self.VALID_FACES:
             raise ValueError(f"Unknown face {face!r}. Choices: {sorted(self.VALID_FACES)}")
-        mode = face.upper()
+        # New expressions degrade to an existing face on older firmware.
+        # An unflashed device must keep serving camera/audio requests.
+        fallback = {"listening": "neutral", "proud": "happy", "surprised": "doubt"}
+        name = face.lower()
+        if name in fallback and "BLOCK_FACE_V1" not in self.info():
+            name = fallback[name]
+        mode = name.upper()
         self._exchange(f"FACE {mode}", f"OK FACE {mode}")
+
+    def gesture(self, name: str) -> None:
+        """Start a bounded firmware preset; ACK is not encoder verification."""
+        if not isinstance(name, str) or name.lower() not in self.VALID_GESTURES:
+            raise ValueError(f"Unknown shoulder gesture: {name!r}")
+        self._require_capability("GESTURE_V1")
+        token = name.upper()
+        self._exchange(f"GESTURE {token}", f"OK GESTURE {token}", timeout=3.0)
 
     def move_head(self, x_tenths: int, y_tenths: int, speed: int = 300) -> None:
         """Request a StackChan head pose; angles use tenths of degrees."""
@@ -246,21 +342,26 @@ class StackChanBridge:
 
     def _expect_line(self, expected: str, *, timeout: float) -> str:
         """Wait for one response, skipping unrelated startup/debug lines."""
-        deadline = time.monotonic() + timeout
-        seen = []
-        while time.monotonic() < deadline:
-            line = self._read_line(deadline)
-            if not line:
-                continue
-            if line == expected:
-                return line
-            if line.startswith("ERR "):
-                raise RuntimeError(f"StackChan: {line}")
-            if len(seen) < 5:
-                seen.append(line)
-        raise TimeoutError(
-            f"Waiting for {expected!r} timed out on {self.port}. Other lines: {seen}"
-        )
+        try:
+            deadline = time.monotonic() + timeout
+            seen = []
+            while time.monotonic() < deadline:
+                line = self._read_line(deadline)
+                if not line:
+                    continue
+                if line == expected:
+                    return line
+                if line.startswith("ERR "):
+                    raise RuntimeError(f"StackChan: {line}")
+                if len(seen) < 5:
+                    seen.append(line)
+            raise TimeoutError(
+                f"Waiting for {expected!r} timed out on {self.port}. Other lines: {seen}"
+            )
+        except Exception:
+            if self.transport == "tcp":
+                self.close()
+            raise
 
     def _require_capability(self, capability: str) -> None:
         if capability not in self.info():
@@ -307,8 +408,8 @@ class StackChanBridge:
 
             header_ready = time.perf_counter()
             self._send_line("READ DATA")
-            # USB CDC normally transfers much faster. These are failure bounds,
-            # not assumed frame rates; do not derive them from 115200 line coding.
+            # USB CDC and local TCP use the same CRC/ACK flow control. These
+            # are failure bounds, not advertised throughput or frame rates.
             transfer_deadline = time.monotonic() + max(5.0, count / 16000.0 + 3.0)
             received = bytearray()
             crc = 0
@@ -340,7 +441,7 @@ class StackChanBridge:
             # At all sensor protocol waits CANCEL is a text command. Sending it
             # releases a firmware MIC wait or DATA/ACK wait before reconnecting.
             # Never do this inside the legacy host-to-device AUDIO binary path.
-            if sent_command and self._serial is not None:
+            if sent_command and self.transport == "serial" and self._serial is not None:
                 try:
                     self._serial.write(b"CANCEL\n")
                 except Exception:
@@ -463,7 +564,7 @@ class StackChanBridge:
         if os.getenv("FRISTON_STACKCHAN_AUDIO_DIAG", "1").lower() not in (
                 "0", "no", "false", "off"):
             print(
-                f"[StackChanUSB] codec={codec_name} ack={packet_bytes} wire={len(wire)}B "
+                f"[StackChan:{self.transport.upper()}] codec={codec_name} ack={packet_bytes} wire={len(wire)}B "
                 f"raw={len(pcm)}B transfer={upload_seconds:.2f}s "
                 f"playback={playback_seconds:.2f}s "
                 f"audio={clip_duration:.2f}s",
@@ -487,30 +588,53 @@ class StackChanBridge:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Friston-3 StackChan face controller")
-    parser.add_argument("--port", default=os.getenv("FRISTON_STACKCHAN_PORT", "COM10"))
+    parser.add_argument("--port", default=None, help="USB COM port or tcp://IP:PORT")
+    parser.add_argument("--transport", choices=("serial", "tcp"), help="Default: FRISTON_STACKCHAN_TRANSPORT or serial")
+    parser.add_argument("--host", help="Numeric device IP for offline TCP (default 192.168.4.1)")
+    parser.add_argument("--tcp-port", type=int, help="Offline TCP port (default 8765)")
     parser.add_argument("--face", choices=sorted(StackChanBridge.VALID_FACES))
+    parser.add_argument("--gesture", choices=sorted(StackChanBridge.VALID_GESTURES),
+                        help="Run one small shoulder gesture on GESTURE_V1 firmware")
     parser.add_argument("--move", nargs=2, type=int, metavar=("X_TENTHS", "Y_TENTHS"))
     parser.add_argument("--speed", type=int, default=300)
     parser.add_argument("--home", action="store_true")
     parser.add_argument("--stop", action="store_true")
     parser.add_argument(
         "--interactive", action="store_true",
-        help="Keep COM port open and switch faces interactively (no re-flash)",
+        help="Keep the connection open and switch faces interactively (no re-flash)",
     )
     parser.add_argument(
-        "--hold", type=float, default=0,
-        help="Keep COM port open for N seconds after sending a face",
+        "--hold", type=float, default=None,
+        help="Keep the connection open for N seconds; TCP presets default to 3 seconds",
     )
     args = parser.parse_args()
-    if not 0 <= args.hold <= 300:
+    if args.hold is not None and not 0 <= args.hold <= 300:
         parser.error("--hold must be between 0 and 300 seconds")
 
     try:
-        with StackChanBridge(port=args.port) as robot:
-            print(f"Connected: {args.port} ({robot.info()})")
+        transport = args.transport
+        if args.port and not args.port.lower().startswith("tcp://") and transport is None:
+            transport = "serial"  # An explicit --port COM10 remains a USB command.
+        robot = StackChanBridge(port=args.port, transport=transport, host=args.host,
+                                tcp_port=args.tcp_port)
+        hold_seconds = args.hold or 0.0
+        if robot.transport == "tcp" and not args.interactive:
+            if (args.move or args.home) and not hold_seconds > 0:
+                parser.error("TCP MOVE/HOME require an explicit positive --hold (or --interactive); "
+                             "disconnecting stops motion. No command was sent.")
+            if args.gesture and args.gesture != "none" and args.hold is None:
+                hold_seconds = 3.0
+            elif args.gesture and args.gesture != "none" and hold_seconds == 0:
+                parser.error("TCP --gesture needs --hold > 0 or omit --hold for 3 seconds; "
+                             "--hold 0 would immediately stop the gesture. No command was sent.")
+        with robot:
+            print(f"Connected: {robot.port} ({robot.info()})")
             if args.face:
                 robot.set_face(args.face)
                 print(f"Face switched to {args.face}")
+            if args.gesture:
+                robot.gesture(args.gesture)
+                print(f"Gesture accepted: {args.gesture}; observe the real head to verify movement")
             if args.move:
                 robot.move_head(args.move[0], args.move[1], args.speed)
                 print(f"Head move command accepted: X={args.move[0] / 10:.1f}, Y={args.move[1] / 10:.1f}")
@@ -520,7 +644,7 @@ def main() -> None:
             if args.stop:
                 robot.stop_head()
                 print("Head stop command accepted")
-            if not (args.face or args.move or args.home or args.stop):
+            if not (args.face or args.gesture or args.move or args.home or args.stop):
                 print("PING -> PONG")
 
             if args.interactive:
@@ -540,11 +664,11 @@ def main() -> None:
                         print(f"Unknown face: {face!r}")
                         continue
                     robot.set_face(face)
-                    print(f"OK FACE {face.upper()} (COM kept open)")
-            elif args.hold:
-                print(f"Keeping {args.port} open for {args.hold:g} seconds...")
-                time.sleep(args.hold)
-    except (serial.SerialException, OSError, TimeoutError, RuntimeError) as exc:
+                    print(f"OK FACE {face.upper()} (connection kept open)")
+            elif hold_seconds:
+                print(f"Keeping {robot.port} open for {hold_seconds:g} seconds...")
+                time.sleep(hold_seconds)
+    except (OSError, TimeoutError, RuntimeError, ValueError) as exc:
         parser.exit(1, f"StackChan connection failed: {exc}\n")
 
 

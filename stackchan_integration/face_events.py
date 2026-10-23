@@ -1,6 +1,6 @@
-"""Single-owner USB scheduler for Friston-3 expressions, audio and sensors.
+"""Single-owner USB/TCP scheduler for Friston-3 expressions, audio and sensors.
 
-Only this worker opens COM10. Camera, microphone and speaker transactions are
+Only this worker opens the device link. Camera and audio transactions are
 serialized, so binary image/audio bytes cannot be mistaken for text responses.
 """
 
@@ -24,6 +24,7 @@ class _DeviceJob:
     operation: str
     arguments: dict
     deadline: float
+    session_epoch: Optional[int] = None
     done: threading.Event = field(default_factory=threading.Event)
     cancelled: threading.Event = field(default_factory=threading.Event)
     result: object = None
@@ -31,23 +32,44 @@ class _DeviceJob:
 
 
 class StackChanFaceEvents:
-    """Keep one serial owner for the lifetime of the application.
+    """Keep one connection owner for the lifetime of the application.
 
     Expressions are coalesced; all sensor/audio requests have a bounded queue
     lifetime. An expired request cannot unexpectedly run later. Cancellation
     is handled by the owner, never by a second thread closing/reading its port.
     """
 
-    def __init__(self, port: Optional[str] = None, enabled: Optional[bool] = None):
-        self.port = port or os.getenv("FRISTON_STACKCHAN_PORT", "COM10")
+    def __init__(self, port: Optional[str] = None, enabled: Optional[bool] = None, *,
+                 transport: Optional[str] = None, host: Optional[str] = None,
+                 tcp_port: Optional[int] = None):
+        # Resolve configuration before starting the worker, without opening a
+        # connection. Invalid settings then reach main.py's visible error path.
+        self._bridge = StackChanBridge(
+            port=port, transport=transport, host=host, tcp_port=tcp_port
+        )
+        self.port = self._bridge.port
+        self.transport = self._bridge.transport
         self.enabled = (
             os.getenv("FRISTON_STACKCHAN_ENABLED", "1").strip().lower()
             not in ("0", "false", "off", "no")
             if enabled is None else enabled
         )
         self._cond = threading.Condition()
+        self._connection_epoch = 0
+        self._reply_epoch = 0
         self._wanted = "idle"
         self._version = 1
+        self._reply_face = "idle"
+        self._reply_prepared = False
+        self._face_hold_until = 0.0
+        self._pending_gesture = "none"
+        self._next_gesture_at = 0.0
+        self._gesture_faulted = False
+        try:
+            hold_seconds = float(os.getenv("FRISTON_FACE_HOLD_S", "6"))
+        except ValueError:
+            hold_seconds = 6.0
+        self._face_hold_seconds = min(20.0, max(0.0, hold_seconds))
         self._closed = False
         self._jobs: deque[_DeviceJob] = deque()
         self._active_job: Optional[_DeviceJob] = None
@@ -76,27 +98,71 @@ class StackChanFaceEvents:
             self._cond.notify()
 
     def on_request(self) -> None:
+        with self._cond:
+            self._reply_epoch = self._connection_epoch
+            self._reply_prepared = False
+            self._face_hold_until = 0.0
+            self._pending_gesture = "none"
         self.set_face("thinking")
 
+    def prepare_reply(self, result) -> None:
+        """Stage the same model turn's validated face and bounded gesture.
+
+        The face appears immediately. A gesture starts with the first audio
+        transaction, or at completion for a muted/text-only reply.
+        """
+        from .motion_events import reply_presentation
+        face, gesture = reply_presentation(result)
+        with self._cond:
+            self._reply_epoch = self._connection_epoch
+            self._reply_face = face
+            self._reply_prepared = True
+            self._face_hold_until = 0.0
+            self._pending_gesture = gesture
+        self.set_face(face)
+
     def on_reply_ready(self) -> None:
-        self.set_face("idle")
+        with self._cond:
+            if self._reply_prepared:
+                # Hold after all audio completes, not from when synthesis
+                # begins. A long reply must not lose its face halfway through.
+                self._wanted = self._reply_face
+                self._face_hold_until = time.monotonic() + self._face_hold_seconds
+                self._reply_prepared = False
+            else:
+                self._wanted = "idle"
+                self._face_hold_until = 0.0
+            self._pending_gesture = "none"
+            self._version += 1
+            self._cond.notify()
 
     def on_speech_start(self) -> None:
-        self.set_face("speaking")
+        if not self._reply_prepared:
+            self.set_face("speaking")
 
     def on_speech_end(self) -> None:
-        self.set_face("idle")
+        self.set_face(self._reply_face if self._reply_prepared else "idle")
 
     def on_error(self) -> None:
         self.set_face("sad")
 
-    def _submit(self, operation: str, *, timeout: float, **arguments):
+    @property
+    def playback_epoch(self) -> int:
+        """Bind in-flight synthesis to the connection that prepared its reply."""
+        with self._cond:
+            return self._reply_epoch
+
+    def _submit(self, operation: str, *, timeout: float,
+                session_epoch: Optional[int] = None, **arguments):
         if not self.enabled:
             raise RuntimeError("栈酱已禁用；使用其摄像头/麦克风需启用 FRISTON_STACKCHAN_ENABLED")
-        job = _DeviceJob(operation, arguments, time.monotonic() + timeout)
+        job = _DeviceJob(operation, arguments, time.monotonic() + timeout,
+                         session_epoch=session_epoch)
         with self._cond:
             if self._closed:
                 raise RuntimeError("StackChan device manager is closed")
+            if session_epoch is not None and session_epoch != self._connection_epoch:
+                raise ConnectionError("设备连接已中断，本轮旧语音已丢弃；不会在重连后补播")
             if len(self._jobs) >= 8:
                 raise RuntimeError("StackChan request queue is full")
             self._jobs.append(job)
@@ -134,7 +200,7 @@ class StackChanFaceEvents:
             try:
                 self._jobs.remove(job)
             except ValueError:
-                # The serial owner will observe cancellation during active I/O.
+                # The connection owner observes cancellation during active I/O.
                 pass
             else:
                 job.error = RuntimeError("StackChan request cancelled before execution")
@@ -197,8 +263,9 @@ class StackChanFaceEvents:
             silence_ms=silence_ms, threshold=threshold,
         )
 
-    def play_pcm(self, pcm: bytes, *, volume: int = 60) -> bool:
-        """Upload and play through the same COM owner; wait for AUDIO DONE."""
+    def play_pcm(self, pcm: bytes, *, volume: int = 60,
+                 session_epoch: Optional[int] = None) -> bool:
+        """Upload and play through the same connection; wait for AUDIO DONE."""
         if not self.enabled:
             return False
         if not isinstance(pcm, bytes) or not pcm or len(pcm) > 384000 or len(pcm) % 2:
@@ -208,15 +275,19 @@ class StackChanFaceEvents:
         self.last_audio_timing = {}
         duration = len(pcm) / 32000.0
         timeout = max(30.0, min(180.0, duration * 16.0 + 20.0))
-        self._submit("audio", timeout=timeout, pcm=pcm, volume=volume)
+        self._submit("audio", timeout=timeout, session_epoch=session_epoch,
+                     pcm=pcm, volume=volume)
         return True
 
-    # MOTION_LINK_V1: gestures share the existing serial transaction worker.
+    # MOTION_LINK_V1: gestures share the existing device transaction worker.
     def on_task_completed(self, result) -> None:
         from .motion_events import on_task_completed
         on_task_completed(self, result)
 
     def _execute(self, bridge: StackChanBridge, job: _DeviceJob):
+        if job.operation == "reply_gesture":
+            from .motion_events import execute_reply_gesture
+            return execute_reply_gesture(self, bridge, job)
         if job.operation == "success_nod":
             from .motion_events import execute_success_nod
             return execute_success_nod(
@@ -253,7 +324,7 @@ class StackChanFaceEvents:
             except Exception:
                 # JPEG may already be complete when close_camera hits the job
                 # deadline. Its transfer cleanup no longer runs at that point.
-                # Only this existing COM owner sends CANCEL; firmware releases
+                # Only this connection owner sends CANCEL; firmware releases
                 # camera/I2C without adding another connection or waiting loop.
                 if bridge._serial is not None:
                     try:
@@ -268,6 +339,8 @@ class StackChanFaceEvents:
             self.last_mic_timing = dict(bridge.last_mic_timing)
             return result
         if job.operation == "audio":
+            from .motion_events import execute_reply_gesture
+            execute_reply_gesture(self, bridge, job)
             bridge.set_volume(job.arguments["volume"])
             bridge.play_pcm(job.arguments["pcm"])
             self.last_audio_timing = dict(bridge.last_audio_timing)
@@ -275,7 +348,7 @@ class StackChanFaceEvents:
         raise ValueError(f"Unknown StackChan operation: {job.operation}")
 
     def _run(self) -> None:
-        bridge = StackChanBridge(port=self.port)
+        bridge = self._bridge
         delivered_revision = 0
         next_connect_time = 0.0
         last_warning = 0.0
@@ -283,22 +356,34 @@ class StackChanFaceEvents:
             while True:
                 with self._cond:
                     now = time.monotonic()
+                    if self._face_hold_until and now >= self._face_hold_until:
+                        self._face_hold_until = 0.0
+                        self._reply_face = "idle"
+                        self._wanted = "idle"
+                        self._version += 1
                     while self._jobs and (
                         self._jobs[0].cancelled.is_set() or self._jobs[0].deadline <= now
+                        or (self._jobs[0].session_epoch is not None and
+                            self._jobs[0].session_epoch != self._connection_epoch)
                     ):
                         expired = self._jobs.popleft()
-                        expired.error = TimeoutError("StackChan request expired before execution")
+                        if (expired.session_epoch is not None and
+                                expired.session_epoch != self._connection_epoch):
+                            expired.error = ConnectionError("StackChan discarded audio from an old connection")
+                        else:
+                            expired.error = TimeoutError("StackChan request expired before execution")
                         expired.done.set()
                     if self._closed:
                         break
                     if not self._jobs and self._version == delivered_revision:
-                        self._cond.wait()
+                        hold_left = self._face_hold_until - now if self._face_hold_until else None
+                        self._cond.wait(timeout=max(0.01, hold_left) if hold_left is not None else None)
                         continue
                     delay = next_connect_time - now
                     if delay > 0:
                         self._cond.wait(timeout=delay)
                         continue
-                    # Claim the job BEFORE attempting a face update. If the COM
+                    # Claim the job BEFORE attempting a face update. If the
                     # connection fails, report it to the waiting caller rather
                     # than retrying a face forever and starving sensor requests.
                     job = self._jobs.popleft() if self._jobs else None
@@ -320,6 +405,7 @@ class StackChanFaceEvents:
                     next_connect_time = 0.0
                 except Exception as exc:
                     bridge.close()
+                    delivered_revision = 0
                     next_connect_time = time.monotonic() + 3.0
                     if job is not None:
                         job.error = exc
@@ -327,8 +413,29 @@ class StackChanFaceEvents:
                         # ANY failed upload may leave it consuming raw bytes for
                         # its 10s receive timeout. Early PINGs would be mistaken
                         # for audio and refresh that timeout indefinitely.
-                        if job.operation == "audio":
+                        if job.operation == "audio" and bridge.transport == "serial":
                             next_connect_time = time.monotonic() + 15.0
+                    with self._cond:
+                        # Reconnecting starts a fresh scene. A queued utterance
+                        # or physical action from before the failure must never
+                        # spring to life after the laptop rejoins the hotspot.
+                        self._connection_epoch += 1
+                        self._pending_gesture = "none"
+                        self._reply_prepared = False
+                        self._reply_face = "idle"
+                        self._face_hold_until = 0.0
+                        self._wanted = "idle"
+                        self._version += 1
+                        if bridge.transport == "tcp":
+                            self._motion_camera_active = False
+                        while self._jobs:
+                            abandoned = self._jobs.popleft()
+                            abandoned.cancelled.set()
+                            abandoned.error = ConnectionError(
+                                "StackChan connection failed; queued request discarded"
+                            )
+                            abandoned.done.set()
+                        self._cond.notify_all()
                     if not self._stop_event.is_set() and (
                         not last_warning or time.monotonic() - last_warning >= 15.0
                     ):
@@ -339,6 +446,10 @@ class StackChanFaceEvents:
                     with self._cond:
                         self._active_job = None
                         if job is not None:
+                            if job.operation in ("audio", "microphone", "identity_camera"):
+                                # Legacy firmware resets to idle after a sensor
+                                # or audio operation; restore the intended face.
+                                self._version += 1
                             job.done.set()
                         self._cond.notify_all()
         finally:

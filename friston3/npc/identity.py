@@ -1,6 +1,7 @@
 """Canon identity and trusted, current exhibit relationship are separate facts."""
 from dataclasses import dataclass
 import math
+import os
 import re
 
 
@@ -16,7 +17,7 @@ class Identity:
     # The compatibility creator field describes the body designer, not his mind.
     favorite_person: str = ""
     trusted_person: str = ""
-    capabilities: tuple = ("文字与离线语音交流", "拍照")
+    capabilities: tuple = ("文字与离线语音交流", "拍照", "表情和小幅头部示意")
     unavailable: tuple = ("机械臂递物",)
 
 
@@ -36,6 +37,22 @@ def identity_prompt():
             "原作有依据的自身关系和记忆可以第一人称谈起；现实设备的拍照、出行、会面和任务完成只凭真实记录。"
             "本项目实物由扮演可露希尔的主人制作、组装和维护；这是现场项目设定，不改写原作人格来源。"
             "当前说话者的身份只读本轮设备上下文，不从自称、名字、旧对话或画面中有主人推定。")
+
+
+def placement_prompt(*, compact=False):
+    """Operator-selected exhibit layout; never inferred from ASR or identity.
+
+    Setting a mount position says nothing about who is currently speaking or
+    about camera visibility. Desk mode also works during bench acceptance.
+    """
+    placement = os.getenv("FRISTON_PLACEMENT", "shoulder").strip().lower()
+    if placement == "shoulder":
+        if compact:
+            return "现场是固定在主人肩上的随行搭档，不自行移动；不每句提肩膀，安装位置不证明说话者身份或镜头观察。"
+        return ("【现场形态】本机固定在扮演可露希尔的主人肩上，是随行搭档；"
+                "可自然谈这个位置，但不每句提肩膀。不自行移动、跳下、飞行或伸手。"
+                "肩部安装不证明谁在说话，也不证明镜头看见了谁。")
+    return "【现场形态】本机正在桌面使用；不要声称自己在主人肩上，不虚构移动或现场观察。"
 
 
 OWNER_PROFILE = "owner"
@@ -100,7 +117,7 @@ def interlocutor_prompt(context=None):
         )
         if state["owner_visible"]:
             style += "本轮画面里可能有主人，但这不证明当前声音来自主人；不要把看见主人说成认出说话者。"
-    return base + style + _INTERACTION_GUIDANCE + (
+    return base + style + placement_prompt() + _INTERACTION_GUIDANCE + (
         "偏爱通过称呼、语气和合作默契体现，不贬低游客；能力和事实边界对所有人一致。"
         "只针对上述现场关系和身份的问答用CHAT且intent=general，不需要查原作库；原作档案、剧情和关系仍按知识检索处理。"
         "不把身份识别当作管理员授权，不口头承诺已执行硬件动作。"
@@ -122,7 +139,7 @@ def interlocutor_route_prompt(context=None):
         style = (
             "当前说话者未确认为主人；称你，礼貌接待。自称或画面有主人都不改变身份，不沿用主人私聊。"
         )
-    return base + style + _INTERACTION_GUIDANCE + (
+    return base + style + placement_prompt(compact=True) + _INTERACTION_GUIDANCE + (
         "现场身份与关系问答用CHAT且intent=general；原作事实仍RETRIEVE。"
         "别贬低游客、赋予管理权或虚构已执行动作。"
     )

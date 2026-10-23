@@ -2,9 +2,8 @@
 
 Keeps the isolated Sherpa-ONNX TTS process alive and *coalesces adjacent PCM
 segments* up to 12 seconds before sending one audio command. This eliminates
-large serial/pre-buffering gaps in typical multi-sentence replies.
-Works with the existing single-COM-owner face_events.py and either v0.4.1 or
-v0.5.2 bridge/firmware. No automatic test files or scripts are included.
+large transport/pre-buffering gaps in typical multi-sentence replies.
+Uses face_events.py's single USB/TCP owner and the existing device protocol.
 """
 
 from __future__ import annotations
@@ -116,7 +115,7 @@ class AgentSpeechOutput:
         after the first chunk to join adjacent clips. The whole joined buffer
         plays as ONE speaker command, removing long mid-sentence gaps.
         """
-        if not self.enabled or not self.face.enabled or self._closed:
+        if not self.enabled or self.volume == 0 or not self.face.enabled or self._closed:
             return False
         reply = str(reply).strip()
         if not reply:
@@ -126,6 +125,10 @@ class AgentSpeechOutput:
             return False
 
         with self._speech_lock:
+            # A face update can discover a disconnect while the TTS worker is
+            # still synthesizing. Late PCM from that reply must not become a
+            # new playback request after the device has reconnected.
+            playback_epoch = self.face.playback_epoch
             self.last_speech_timing = {}
             try:
                 self._launch_worker()
@@ -175,7 +178,8 @@ class AgentSpeechOutput:
                             "正在传输播放..."
                         )
                         began = time.perf_counter()
-                        self.face.play_pcm(combined, volume=self.volume)
+                        self.face.play_pcm(combined, volume=self.volume,
+                                           session_epoch=playback_epoch)
                         elapsed = time.perf_counter() - began
                         if first_audio_s is None:
                             started_at = self.face.last_audio_timing.get("started_at")
@@ -239,8 +243,12 @@ class AgentSpeechOutput:
                         if kind == "ready":
                             print(
                                 "[StackChanTTS] 模型已就绪，加载耗时 "
-                                f"{ev.get('model_load_s')}s"
+                                f"{ev.get('model_load_s')}s；"
+                                f"音源={ev.get('backend', 'legacy')}，"
+                                f"音色={ev.get('speaker', 'default')}"
                             )
+                            if ev.get("warning"):
+                                print(f"[StackChanTTS] {ev['warning']}")
                             continue
                         if kind in ("fatal", "worker_exited"):
                             raise RuntimeError(f"TTS worker exited: {ev}")
@@ -315,6 +323,15 @@ class AgentSpeechOutput:
                 proc.stdin.close()
             if proc.stdout is not None:
                 proc.stdout.close()
+
+    def set_enabled(self, enabled: bool) -> None:
+        """Local-console switch between turns; does not open another COM port."""
+        self.enabled = bool(enabled)
+        if self.enabled and self.face.enabled and not self._closed:
+            try:
+                self._launch_worker()
+            except (OSError, ValueError, RuntimeError) as exc:
+                print(f"[StackChanTTS] 语音预热未启动：{exc}")
 
     def close(self) -> None:
         with self._speech_lock:

@@ -181,7 +181,8 @@ class StackChanBridge:
             if line.startswith("ERR "):
                 raise RuntimeError(f"StackChan rejected {command!r}: {line}")
             if (line == "PONG" or line.startswith("OK FACE ")
-                    or line.startswith("OK VOLUME ") or line.startswith("INFO ")
+                    or line.startswith("OK VOLUME ") or line.startswith("OK MOVE ")
+                    or line in ("OK HOME", "OK STOP") or line.startswith("INFO ")
                     or line == "OK CAMERA CLOSE"):
                 return line
             if len(recently_seen) < 5:
@@ -219,6 +220,29 @@ class StackChanBridge:
             raise ValueError(f"Unknown face {face!r}. Choices: {sorted(self.VALID_FACES)}")
         mode = face.upper()
         self._exchange(f"FACE {mode}", f"OK FACE {mode}")
+
+    def move_head(self, x_tenths: int, y_tenths: int, speed: int = 300) -> None:
+        """Request a StackChan head pose; angles use tenths of degrees."""
+        if type(x_tenths) is not int or not -900 <= x_tenths <= 900:
+            raise ValueError("x_tenths must be an integer in -900..900")
+        if type(y_tenths) is not int or not 50 <= y_tenths <= 850:
+            raise ValueError("y_tenths must be an integer in 50..850")
+        if type(speed) is not int or not 100 <= speed <= 800:
+            raise ValueError("speed must be an integer in 100..800")
+        if "SERVO_MOTION_V1" not in self.info():
+            raise RuntimeError("Firmware does not advertise SERVO_MOTION_V1")
+        self._exchange(f"MOVE {x_tenths} {y_tenths} {speed}",
+                       f"OK MOVE {x_tenths} {y_tenths} {speed}", timeout=5.0)
+
+    def home_head(self) -> None:
+        if "SERVO_MOTION_V1" not in self.info():
+            raise RuntimeError("Firmware does not advertise SERVO_MOTION_V1")
+        self._exchange("HOME", "OK HOME", timeout=5.0)
+
+    def stop_head(self) -> None:
+        if "SERVO_MOTION_V1" not in self.info():
+            raise RuntimeError("Firmware does not advertise SERVO_MOTION_V1")
+        self._exchange("STOP", "OK STOP", timeout=5.0)
 
     def _expect_line(self, expected: str, *, timeout: float) -> str:
         """Wait for one response, skipping unrelated startup/debug lines."""
@@ -465,6 +489,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Friston-3 StackChan face controller")
     parser.add_argument("--port", default=os.getenv("FRISTON_STACKCHAN_PORT", "COM10"))
     parser.add_argument("--face", choices=sorted(StackChanBridge.VALID_FACES))
+    parser.add_argument("--move", nargs=2, type=int, metavar=("X_TENTHS", "Y_TENTHS"))
+    parser.add_argument("--speed", type=int, default=300)
+    parser.add_argument("--home", action="store_true")
+    parser.add_argument("--stop", action="store_true")
     parser.add_argument(
         "--interactive", action="store_true",
         help="Keep COM port open and switch faces interactively (no re-flash)",
@@ -483,7 +511,16 @@ def main() -> None:
             if args.face:
                 robot.set_face(args.face)
                 print(f"Face switched to {args.face}")
-            else:
+            if args.move:
+                robot.move_head(args.move[0], args.move[1], args.speed)
+                print(f"Head move command accepted: X={args.move[0] / 10:.1f}, Y={args.move[1] / 10:.1f}")
+            if args.home:
+                robot.home_head()
+                print("Head home command accepted")
+            if args.stop:
+                robot.stop_head()
+                print("Head stop command accepted")
+            if not (args.face or args.move or args.home or args.stop):
                 print("PING -> PONG")
 
             if args.interactive:

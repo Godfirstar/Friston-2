@@ -56,6 +56,22 @@ class RealCamera:
             return {"success": False, "error": "保存照片失败"}
         return {"success": True, "path": str(path)}
 
+    def snapshot_for_identity(self, *, timeout=2.5):
+        """Serial PC snapshot; native camera calls have no Python hard timeout."""
+        if not self.open():
+            raise RuntimeError("身份识别无法打开电脑摄像头")
+        try:
+            frame = None
+            for _ in range(4):
+                value = self.read()
+                if value is not None:
+                    frame = value
+            if frame is None:
+                raise RuntimeError("身份识别没有获取到电脑摄像头画面")
+            return frame
+        finally:
+            self.close()
+
     def capture(self):
         """执行一次普通拍照，并在结束后释放摄像头。"""
         print("[Device] 正在拍照...")
@@ -107,6 +123,16 @@ class StackChanCamera(RealCamera):
         expected = (width * 3 // 4, width)
         if frame.shape[:2] != expected:
             raise RuntimeError(f"栈酱图像尺寸异常：{frame.shape[:2]}，预期 {expected}")
+        return frame
+
+    def snapshot_for_identity(self, *, timeout=2.5):
+        """Fresh low-resolution frame; capture and I2C release are one job."""
+        import numpy as np
+
+        jpeg = self.device.capture_identity_jpeg(width=self.width, timeout=timeout)
+        frame = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if frame is None or frame.shape[:2] != (self.width * 3 // 4, self.width):
+            raise RuntimeError("身份识别收到无效的栈酱画面")
         return frame
 
     def open(self):

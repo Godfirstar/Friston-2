@@ -62,7 +62,11 @@ def _alias(db, entity_id, alias, origin, priority=50):
     if not value or len(alias) > 100 or alias in ('无', '未知', '暂无', '不详', 'None'):
         return
     db.execute('''INSERT INTO aliases VALUES(?,?,?,?,?) ON CONFLICT(alias_norm,entity_id)
-        DO UPDATE SET priority=MAX(priority,excluded.priority)''',
+        DO UPDATE SET priority=MAX(aliases.priority,excluded.priority),
+        origin=CASE
+          WHEN aliases.origin='canonical_name' OR excluded.origin='canonical_name' THEN 'canonical_name'
+          WHEN aliases.origin='alias_table' OR excluded.origin='alias_table' THEN 'alias_table'
+          ELSE aliases.origin END''',
         (value, entity_id, alias, origin, priority))
 
 

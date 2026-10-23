@@ -6,6 +6,7 @@ discourse continuity; persisted model replies are not reloaded as facts.
 User reports and actual skill results live in separate tables and remain labelled.
 """
 from contextlib import closing
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 import re
@@ -120,3 +121,51 @@ class MemoryStore:
             for table in ("conversations", "user_memories", "execution_events"):
                 counts[table] = db.execute(f"DELETE FROM {table}").rowcount
         return counts
+
+
+class SessionMemory:
+    """A visitor's execution facts last only for their current interaction.
+
+    No database is opened, no utterance is audited, and no owner's explicit
+    notes are readable through this object. Conversation continuity remains in
+    NpcTalkSkill's bounded deques. Handover discards this object.
+    """
+    def __init__(self):
+        self.events = deque(maxlen=10)
+
+    def log_turn(self, user_text, reply):
+        return None
+
+    def record_execution(self, skill_name, result):
+        if (skill_name not in ("take_photo", "auto_photo") or not isinstance(result, dict)
+                or not isinstance(result.get("success"), bool)):
+            return
+        self.events.append({
+            "id": len(self.events) + 1, "skill": skill_name,
+            "success": int(result["success"]), "message": str(result.get("message", ""))[:500],
+            "source": "skill_result", "created_at": MemoryStore._now(),
+        })
+
+    def recent_execution_events(self, limit=2):
+        return [dict(event) for event in list(self.events)[-max(1, min(10, int(limit))):][::-1]]
+
+    def recall(self, user_text, limit=3, *, include_execution=True):
+        if not include_execution:
+            return ""
+        if not any(word in user_text for word in ("上次", "刚才", "拍过", "拍了", "做过", "经历", "回忆")):
+            return ""
+        return "\n".join(
+            f"[skill_result，本次访客会话真实执行，{event['created_at']}] {event['skill']}："
+            f"{'成功' if event['success'] else '失败'}，{event['message'][:140]}"
+            for event in self.recent_execution_events(2))
+
+    def remember(self, statement):
+        raise RuntimeError("访客会话不写入主人的长期记忆")
+
+    def forget(self, query):
+        raise RuntimeError("访客会话不能删除主人的长期记忆")
+
+    def clear_all(self):
+        count = len(self.events)
+        self.events.clear()
+        return {"conversations": 0, "user_memories": 0, "execution_events": count}

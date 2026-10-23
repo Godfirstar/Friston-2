@@ -1,34 +1,36 @@
-﻿# Run ONCE with PowerShell inside an activated conda environment if desired.
-# No administrator rights, no Git commit, no modification of Friston-3 source files.
+# Installs a per-user login shortcut for the CURRENT ResearchJournal folder.
+# Doesn't touch app source, does not run tests or Git commands.
 $ErrorActionPreference = 'Stop'
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $agent = Join-Path $here 'journal.py'
-
-$pyExe = (Get-Command python -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
-
-if (-not (Test-Path -LiteralPath $pyExe)) {
-    throw "Python executable not found: $pyExe"
-}$pyExe = $pyExe.Trim()
-$pySilent = Join-Path (Split-Path $pyExe -Parent) 'pythonw.exe'
-if (-not (Test-Path $pySilent)) { $pySilent = $pyExe }
-
+if (-not (Test-Path -LiteralPath $agent)) { throw "Cannot find journal.py: $agent" }
+$pyCmd = Get-Command python -CommandType Application -ErrorAction Stop | Select-Object -First 1
+$pyExe = [string] $pyCmd.Source
+if (-not (Test-Path -LiteralPath $pyExe)) { throw "Cannot find Python: $pyExe" }
+$pythonw = Join-Path (Split-Path $pyExe -Parent) 'pythonw.exe'
+if (-not (Test-Path -LiteralPath $pythonw)) { $pythonw = $pyExe }
 $startup = [Environment]::GetFolderPath('Startup')
-if (-not (Test-Path $startup)) { throw '无法定位当前用户的 Startup 启动目录。' }
-$linkPath = Join-Path $startup 'Friston2-ResearchJournal.lnk'
+if (-not (Test-Path -LiteralPath $startup)) { throw 'Windows Startup folder was not found.' }
+$shortcut = Join-Path $startup 'Friston3-ResearchJournal.lnk'
+$legacyShortcut = Join-Path $startup 'Friston2-ResearchJournal.lnk'
 $shell = New-Object -ComObject WScript.Shell
-$link = $shell.CreateShortcut($linkPath)
-$link.TargetPath = $pySilent
+# Remove only the legacy shortcut owned by ResearchJournal.
+if (Test-Path -LiteralPath $legacyShortcut) {
+    $legacy = $shell.CreateShortcut($legacyShortcut)
+    if ($legacy.Arguments -match '(?i)ResearchJournal[\\/]journal\.py') {
+        Remove-Item -LiteralPath $legacyShortcut -Force
+    } else {
+        Write-Warning "Legacy shortcut was not recognized; please inspect it: $legacyShortcut"
+    }
+}
+$link = $shell.CreateShortcut($shortcut)
+$link.TargetPath = $pythonw
 $link.Arguments = '"' + $agent + '" watch'
 $link.WorkingDirectory = $here
-$link.Description = 'Friston-3 source snapshot -> automatic Obsidian research logs'
 $link.WindowStyle = 7
+$link.Description = 'Friston-3 ResearchJournal 10-minute source watcher'
 $link.Save()
-
-Write-Host ('开机自启已安装: ' + $linkPath) -ForegroundColor Green
-Write-Host ('Python interpreter: ' + $pySilent)
-Write-Host '每次启动电脑后运行，无需手动 Git commit。'
-
-# Launch immediately. journal.py uses an instance lock to avoid duplicates.
-Start-Process -FilePath $pySilent -WorkingDirectory $here -ArgumentList ('"' + $agent + '" watch') -WindowStyle Hidden
-Write-Host ('现在开始后台监听。Obsidian 可打开: ' + (Join-Path $here 'vault')) -ForegroundColor Green
-Write-Host '无旧基线时先建立源码基线；之后按 config.json 中的模式和周期记录源码变化。'
+Write-Host "Startup shortcut created: $shortcut" -ForegroundColor Green
+Write-Host "Python executable: $pythonw"
+Start-Process -FilePath $pythonw -ArgumentList ('"' + $agent + '" watch') -WorkingDirectory $here -WindowStyle Hidden
+Write-Host 'Watcher launch requested. Verify with: python .\ResearchJournal\journal.py status'

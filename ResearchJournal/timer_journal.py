@@ -108,6 +108,11 @@ def run_once(config):
     old = bootstrap(config)
     j.import_inbox(config)
     current = select(j.scan(config), config)
+    old_package = sum(k.startswith('friston2/') for k in old['files'])
+    new_package = sum(k.startswith('friston3/') for k in current)
+    if old_package >= 3 and new_package >= 3 and not any(k.startswith('friston2/') for k in current):
+        j.log('Detected stale Friston-2 timer baseline; run ResearchJournal/rename-fix/migrate_baseline.py (historical data will be archived).')
+        return 'Old Friston-2 baseline needs migration; no AI summary created.'
     diff = j.changed_files(old['files'], current)
     status = j.load_json(TIMER_STATE, {})
     status['last_checked_at'] = j.time_text()
@@ -170,8 +175,14 @@ def status(config):
     current = select(j.scan(config), config)
     extensions, include = _selection(config)
     changes = j.changed_files(old['files'], current) if old else []
+    old_dirs = {p.split('/')[0] for p in old['files'] if p.startswith(('friston2/', 'friston3/'))} if old else set()
+    new_dirs = {p.split('/')[0] for p in current if p.startswith(('friston2/', 'friston3/'))}
     lines = [
         'ResearchJournal v3.4 - 10-minute timer mode',
+        'Resolved project root: ' + str(j.PROJECT),
+        'Current source files in scope: ' + str(len(current)),
+        'Baseline source packages: ' + (', '.join(sorted(old_dirs)) or 'none'),
+        'Current source packages: ' + (', '.join(sorted(new_dirs)) or 'none'),
         f'Trigger: {config.get("trigger_mode", "unknown")}',
         f'Check period: {_interval(config)} seconds',
         'Git commits: not used as triggers',
@@ -186,6 +197,8 @@ def status(config):
                                    if (j.STATE / 'watch.pid').exists() else 'not found'),
         'Model: ' + ' / '.join(j.codex_model_info(config)),
     ]
+    if 'friston2' in old_dirs and 'friston3' in new_dirs and 'friston2' not in new_dirs:
+        lines.append('WARNING: baseline still refers to old package friston2/. Run rename migration before automatic analysis.')
     for filename in changes[:12]:
         lines.append('  - ' + filename)
     if state.get('last_error'):

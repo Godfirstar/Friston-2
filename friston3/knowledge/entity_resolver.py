@@ -11,6 +11,22 @@ def _all_aliases(db):
       a.origin,e.name,e.kind,e.source_key
       FROM aliases a JOIN entities e ON a.entity_id=e.id
       ORDER BY a.priority DESC,a.entity_id''').fetchall()]
+    # Canonical entity names must resolve even when an older database omitted
+    # the corresponding alias row. Use entity/name pairs: another entity's
+    # alias with the same spelling must not hide this canonical candidate.
+    existing = {(row['entity_id'], row['alias_norm']) for row in rows}
+    people = db.execute("""SELECT id,name,kind,source_key FROM entities
+        WHERE kind IN ('character','machine','fan_machine','dialogue_speaker')
+        ORDER BY id""")
+    for entity in people:
+        word = normalize(entity['name'])
+        key = (entity['id'], word)
+        if not word or key in existing:
+            continue
+        existing.add(key)
+        rows.append({'alias_norm': word, 'alias': entity['name'], 'entity_id': entity['id'],
+                     'priority': 100, 'origin': 'canonical_name', 'name': entity['name'],
+                     'kind': entity['kind'], 'source_key': entity['source_key']})
     # Reference nodes are imported from relation labels, not from a small
     # curated faction list. They have no independent biography. Repeated labels
     # form one lookup topic; retrieval still checks every original source edge.

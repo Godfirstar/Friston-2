@@ -144,11 +144,35 @@ class StackChanFaceEvents:
     def get_info(self) -> str:
         return self._submit("info", timeout=12.0)
 
+    def move_head(self, x_tenths: int, y_tenths: int, speed: int = 300) -> None:
+        if type(x_tenths) is not int or not -900 <= x_tenths <= 900:
+            raise ValueError("x_tenths must be an integer in -900..900")
+        if type(y_tenths) is not int or not 50 <= y_tenths <= 850:
+            raise ValueError("y_tenths must be an integer in 50..850")
+        if type(speed) is not int or not 100 <= speed <= 800:
+            raise ValueError("speed must be an integer in 100..800")
+        self._submit("move_head", timeout=8.0, x_tenths=x_tenths,
+                     y_tenths=y_tenths, speed=speed)
+
+    def home_head(self) -> None:
+        self._submit("home_head", timeout=8.0)
+
+    def stop_head(self) -> None:
+        self._submit("stop_head", timeout=8.0)
+
     def capture_jpeg(self, width: int = 320) -> bytes:
         if type(width) is not int or width not in (320, 640):
             raise ValueError("Camera width must be 320 or 640")
         self.last_camera_timing = {}
         return self._submit("camera", timeout=55.0, width=width)
+
+    def capture_identity_jpeg(self, width: int = 320, *, timeout: float = 2.5) -> bytes:
+        """One bounded capture-and-release job, shared with MIC/TTS/photo I/O."""
+        if type(width) is not int or width not in (320, 640):
+            raise ValueError("Camera width must be 320 or 640")
+        if not isinstance(timeout, (int, float)) or not 0.5 <= timeout <= 8:
+            raise ValueError("Identity camera timeout must be 0.5..8 seconds")
+        return self._submit("identity_camera", timeout=float(timeout), width=width)
 
     def close_camera(self) -> None:
         self._submit("camera_close", timeout=12.0)
@@ -187,13 +211,56 @@ class StackChanFaceEvents:
         self._submit("audio", timeout=timeout, pcm=pcm, volume=volume)
         return True
 
+    # MOTION_LINK_V1: gestures share the existing serial transaction worker.
+    def on_task_completed(self, result) -> None:
+        from .motion_events import on_task_completed
+        on_task_completed(self, result)
+
     def _execute(self, bridge: StackChanBridge, job: _DeviceJob):
+        if job.operation == "success_nod":
+            from .motion_events import execute_success_nod
+            return execute_success_nod(
+                bridge, job,
+                camera_active=getattr(self, "_motion_camera_active", False))
+        # Keep camera ownership conservative after failures. v3 MOVE can close
+        # the camera, so automatic gestures must never run during its session.
+        if job.operation in ("camera", "identity_camera"):
+            self._motion_camera_active = True
+        result = self._execute_core(bridge, job)
+        if job.operation in ("camera_close", "identity_camera", "audio", "microphone"):
+            self._motion_camera_active = False
+        return result
+
+    def _execute_core(self, bridge: StackChanBridge, job: _DeviceJob):
         if job.operation == "info":
             return bridge.info()
+        if job.operation == "move_head":
+            return bridge.move_head(**job.arguments)
+        if job.operation == "home_head":
+            return bridge.home_head()
+        if job.operation == "stop_head":
+            return bridge.stop_head()
         if job.operation == "camera":
             result = bridge.capture_jpeg(**job.arguments)
             self.last_camera_timing = dict(bridge.last_camera_timing)
             return result
+        if job.operation == "identity_camera":
+            try:
+                result = bridge.capture_jpeg(**job.arguments)
+                self.last_camera_timing = dict(bridge.last_camera_timing)
+                bridge.close_camera()
+                return result
+            except Exception:
+                # JPEG may already be complete when close_camera hits the job
+                # deadline. Its transfer cleanup no longer runs at that point.
+                # Only this existing COM owner sends CANCEL; firmware releases
+                # camera/I2C without adding another connection or waiting loop.
+                if bridge._serial is not None:
+                    try:
+                        bridge._serial.write(b"CANCEL\n")
+                    except Exception:
+                        pass
+                raise
         if job.operation == "camera_close":
             return bridge.close_camera()
         if job.operation == "microphone":

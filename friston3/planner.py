@@ -8,7 +8,7 @@ from urllib.request import Request, urlopen
 from friston3.config import OLLAMA_MODEL, OLLAMA_CHAT_URL, OLLAMA_OPTIONS, OLLAMA_KEEP_ALIVE
 from friston3.npc.agentic_rag import (
     AgenticSettings, ROUTE_SCHEMA, ROUTE_TOKENS, _unique_object,
-    build_route_input, parse_decision,
+    build_route_input, normalize_entity_choices, parse_decision, route_schema_for_signals,
 )
 
 
@@ -38,7 +38,8 @@ class LLMPlanner:
         if not isinstance(instruction, str) or not instruction.strip():
             return None
         context = dialogue_context or {}
-        schema = deepcopy(ROUTE_SCHEMA)
+        signals = context.get("signals", {})
+        schema = route_schema_for_signals(signals)
         schema["properties"]["route"]["enum"].append("ACTION")
         # A protocol-level whitelist, not a natural-language keyword router.
         schema["properties"] = {
@@ -59,6 +60,7 @@ class LLMPlanner:
                 instruction, history=context.get("history", []), topic=context.get("topic", {}),
                 memory_context=context.get("memory_context", ""),
                 signals=context.get("signals", {}), pending_reference=context.get("pending_reference", {}),
+                interlocutor_context=context.get("interlocutor"),
                 estimate_tokens=self._estimate_tokens,
                 tool_help={name: self.TOOL_HELP[name] for name in self.allowed})
             self.last_input = messages
@@ -127,9 +129,13 @@ class LLMPlanner:
                     raise ValueError("npc_talk may not supply execution arguments")
                 decision = parse_decision(json.dumps({key: call[key] for key in ROUTE_SCHEMA["required"]},
                                                      ensure_ascii=False),
+                                          signals=signals,
+                                          pending_reference=context.get("pending_reference"),
                                           diagnostics=self.last_call)
+                decision = normalize_entity_choices(decision, signals, diagnostics=self.last_call)
             else:
                 if (call["route"] != "ACTION" or call["query"] != "" or call["reply"] != ""
+                        or call["entity_choices"] != []
                         or call["followup"] is not False or call["intent"] != "general"
                         or call["detail"] is not False):
                     raise ValueError("hardware action may not contain dialogue claims")

@@ -7,7 +7,6 @@ serialized, so binary image/audio bytes cannot be mistaken for text responses.
 from __future__ import annotations
 
 import logging
-import os
 import threading
 import time
 from collections import deque
@@ -15,6 +14,8 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from .stackchan_bridge import StackChanBridge
+from .connection import preference_name
+from friston3.runtime_settings import SETTINGS
 
 LOG = logging.getLogger(__name__)
 
@@ -25,6 +26,9 @@ class _DeviceJob:
     arguments: dict
     deadline: float
     session_epoch: Optional[int] = None
+    motion_turn: Optional[int] = None
+    motion_revision: Optional[int] = None
+    motion_phase: Optional[str] = None
     done: threading.Event = field(default_factory=threading.Event)
     cancelled: threading.Event = field(default_factory=threading.Event)
     result: object = None
@@ -44,32 +48,43 @@ class StackChanFaceEvents:
                  tcp_port: Optional[int] = None):
         # Resolve configuration before starting the worker, without opening a
         # connection. Invalid settings then reach main.py's visible error path.
+        selected = transport or ("usb" if port and not port.lower().startswith("tcp://")
+                                 else "wifi" if port else SETTINGS.get("connection_preference", "auto"))
         self._bridge = StackChanBridge(
-            port=port, transport=transport, host=host, tcp_port=tcp_port
+            port=port, transport=selected, host=host, tcp_port=tcp_port
         )
         self.port = self._bridge.port
         self.transport = self._bridge.transport
-        self.enabled = (
-            os.getenv("FRISTON_STACKCHAN_ENABLED", "1").strip().lower()
-            not in ("0", "false", "off", "no")
-            if enabled is None else enabled
-        )
+        self.enabled = True if enabled is None else bool(enabled)
         self._cond = threading.Condition()
+        self._connected = False
+        self._connection_error = "正在自动发现栈酱"
+        self._desired_preference = self._bridge.preference
+        self._preference_dirty = False
         self._connection_epoch = 0
-        self._reply_epoch = 0
+        self._reply_epoch = -1
+        self._turn_active = False
         self._wanted = "idle"
         self._version = 1
         self._reply_face = "idle"
         self._reply_prepared = False
         self._face_hold_until = 0.0
         self._pending_gesture = "none"
-        self._next_gesture_at = 0.0
+        self._motion_turn = 0
+        self._motion_revision = 0
+        self._motion_phase = "idle"
+        self._motion_camera_active = False
+        self._next_state_motion_at = {"listening": 0.0, "thinking": 0.0}
+        self._next_reply_motion_at = 0.0
+        self._next_speech_beat_at = 0.0
+        self._reply_emotion = "neutral"
+        self._reply_variation = 0
+        self._auto_motion_counter = 0
+        self._reply_audio_segments = 0
+        self._reply_beats = 0
+        self._reply_motion_allowed = False
         self._gesture_faulted = False
-        try:
-            hold_seconds = float(os.getenv("FRISTON_FACE_HOLD_S", "6"))
-        except ValueError:
-            hold_seconds = 6.0
-        self._face_hold_seconds = min(20.0, max(0.0, hold_seconds))
+        self._face_hold_seconds = 6.0
         self._closed = False
         self._jobs: deque[_DeviceJob] = deque()
         self._active_job: Optional[_DeviceJob] = None
@@ -78,11 +93,51 @@ class StackChanFaceEvents:
         self.last_audio_timing: dict[str, float | str] = {}
         self.last_camera_timing: dict[str, float | int] = {}
         self.last_mic_timing: dict[str, float | int] = {}
+        self.last_motion_result: dict = {}
         if self.enabled:
             self._worker = threading.Thread(
                 target=self._run, daemon=True, name="stackchan-hardware"
             )
             self._worker.start()
+
+    def connection_status(self) -> dict:
+        """A thread-safe snapshot; checking status never probes another port."""
+        with self._cond:
+            return {
+                "connected": self._connected,
+                "transport": self.transport,
+                "endpoint": self.port,
+                "preference": self._desired_preference,
+                "epoch": self._connection_epoch,
+                "error": self._connection_error,
+                "busy": self._active_job.operation if self._active_job else "",
+                "motion": dict(self.last_motion_result),
+                "switch_pending": self._preference_dirty or (
+                    self._connected and self._desired_preference != "auto" and
+                    {"usb": "serial", "wifi": "tcp"}.get(self._desired_preference) != self.transport),
+            }
+
+    def set_connection_preference(self, preference: str) -> dict:
+        preference = preference_name(preference)
+        # Persist before changing the live preference; failed saves never claim
+        # a preference that would disappear at the next startup.
+        SETTINGS.update(connection_preference=preference)
+        with self._cond:
+            self._desired_preference = preference
+            self._preference_dirty = True
+            self._cond.notify_all()
+        return self.connection_status()
+
+    def wait_ready(self, timeout: float = 1.0) -> bool:
+        """Wait in short interruptible intervals while the owner reconnects."""
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        with self._cond:
+            while not self._connected and not self._closed:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._cond.wait(timeout=min(0.1, remaining))
+            return self._connected and not self._closed
 
     def set_face(self, face: str) -> None:
         face = face.lower()
@@ -99,11 +154,21 @@ class StackChanFaceEvents:
 
     def on_request(self) -> None:
         with self._cond:
-            self._reply_epoch = self._connection_epoch
+            self._motion_turn += 1
+            self._motion_revision += 1
+            self._motion_phase = "thinking"
+            self._discard_queued_motion_locked()
+            self._turn_active = True
+            # A console request begun while disconnected has no hardware
+            # session to resume on. Its text reply may still complete.
+            self._reply_epoch = self._connection_epoch if self._connected else -1
             self._reply_prepared = False
             self._face_hold_until = 0.0
             self._pending_gesture = "none"
+            self._reply_audio_segments = self._reply_beats = 0
+            self._reply_motion_allowed = False
         self.set_face("thinking")
+        self._queue_state_motion("think", "thinking", cooldown=9.0)
 
     def prepare_reply(self, result) -> None:
         """Stage the same model turn's validated face and bounded gesture.
@@ -114,15 +179,37 @@ class StackChanFaceEvents:
         from .motion_events import reply_presentation
         face, gesture = reply_presentation(result)
         with self._cond:
-            self._reply_epoch = self._connection_epoch
+            self._motion_revision += 1
+            self._motion_phase = "reply"
+            self._discard_queued_motion_locked()
+            if self._reply_epoch != self._connection_epoch or not self._connected:
+                self._pending_gesture = "none"
+                self._reply_prepared = False
+                return
             self._reply_face = face
             self._reply_prepared = True
             self._face_hold_until = 0.0
             self._pending_gesture = gesture
+            presentation = result.get("presentation", {}) if isinstance(result, dict) else {}
+            emotion = presentation.get("emotion") if isinstance(presentation, dict) else None
+            self._reply_emotion = emotion if isinstance(emotion, str) else "neutral"
+            self._reply_variation = self._auto_motion_counter
+            if gesture == "auto":
+                self._auto_motion_counter += 1
+            self._reply_audio_segments = self._reply_beats = 0
+            self._reply_motion_allowed = False
+            if gesture == "none":
+                # The answer can explicitly request stillness. A THINK cue
+                # already sent while planning must not linger into that reply.
+                self._queue_stop_motion_locked()
         self.set_face(face)
 
     def on_reply_ready(self) -> None:
         with self._cond:
+            self._turn_active = False
+            self._motion_phase = "idle"
+            self._motion_revision += 1
+            self._discard_queued_motion_locked()
             if self._reply_prepared:
                 # Hold after all audio completes, not from when synthesis
                 # begins. A long reply must not lose its face halfway through.
@@ -133,6 +220,7 @@ class StackChanFaceEvents:
                 self._wanted = "idle"
                 self._face_hold_until = 0.0
             self._pending_gesture = "none"
+            self._reply_motion_allowed = False
             self._version += 1
             self._cond.notify()
 
@@ -147,22 +235,91 @@ class StackChanFaceEvents:
         self.set_face("sad")
 
     @property
+    def connection_epoch(self) -> int:
+        """Current hardware session; sensor caches invalidate when this changes."""
+        with self._cond:
+            return self._connection_epoch
+
+    @property
     def playback_epoch(self) -> int:
         """Bind in-flight synthesis to the connection that prepared its reply."""
         with self._cond:
             return self._reply_epoch
 
+    def _discard_queued_motion_locked(self) -> None:
+        """Remove decorative jobs only; sensor/audio and explicit stops survive."""
+        kept = deque()
+        for job in self._jobs:
+            if job.operation in ("motion_event", "reply_gesture"):
+                job.cancelled.set()
+                job.result = {"status": "skipped", "reason": "superseded"}
+                job.done.set()
+            else:
+                kept.append(job)
+        self._jobs = kept
+
+    def _queue_stop_motion_locked(self) -> None:
+        if not self.enabled or not self._connected or self._closed:
+            return
+        if any(job.operation == "motion_stop" for job in self._jobs):
+            return
+        # Stop is bounded and uses the same owner. Putting it before queued
+        # jobs never interrupts a binary transaction already in progress.
+        self._jobs.appendleft(_DeviceJob("motion_stop", {}, time.monotonic() + 4.0,
+                                        session_epoch=self._connection_epoch))
+        self._cond.notify_all()
+
+    def _queue_state_motion(self, gesture: str, phase: str, *, cooldown: float) -> None:
+        """No wait in the caller: short-lived state cues cannot delay planning."""
+        with self._cond:
+            now = time.monotonic()
+            if (not self.enabled or self._closed or not self._connected
+                    or self._gesture_faulted or self._motion_camera_active
+                    or not SETTINGS.get("gestures_enabled", True)
+                    or self._motion_phase != phase
+                    or now < self._next_state_motion_at.get(phase, 0.0)
+                    or len(self._jobs) >= 7):
+                return
+            self._next_state_motion_at[phase] = now + cooldown
+            self._jobs.append(_DeviceJob(
+                "motion_event", {"gesture": gesture}, now + 2.0,
+                session_epoch=self._connection_epoch, motion_turn=self._motion_turn,
+                motion_revision=self._motion_revision, motion_phase=phase))
+            self._cond.notify_all()
+
+    def cancel_motion(self) -> dict:
+        """Clear queued cues, then wait for a stop ACK on the existing worker.
+
+        This remains available after gestures_enabled becomes false. A lost
+        connection is not re-opened to replay a stop or any earlier gesture.
+        """
+        with self._cond:
+            self._motion_revision += 1
+            self._discard_queued_motion_locked()
+            self._pending_gesture = "none"
+            self._reply_motion_allowed = False
+            if not self.enabled or not self._connected or self._closed:
+                return {"status": "skipped", "reason": "not_connected"}
+        return self._submit("motion_stop", timeout=4.0)
+
     def _submit(self, operation: str, *, timeout: float,
                 session_epoch: Optional[int] = None, **arguments):
         if not self.enabled:
-            raise RuntimeError("栈酱已禁用；使用其摄像头/麦克风需启用 FRISTON_STACKCHAN_ENABLED")
+            raise RuntimeError("栈酱设备管理器未启用")
         job = _DeviceJob(operation, arguments, time.monotonic() + timeout,
                          session_epoch=session_epoch)
         with self._cond:
             if self._closed:
                 raise RuntimeError("StackChan device manager is closed")
+            if not self._connected:
+                raise ConnectionError("栈酱尚未连接，正在自动恢复；本次设备请求未执行")
             if session_epoch is not None and session_epoch != self._connection_epoch:
                 raise ConnectionError("设备连接已中断，本轮旧语音已丢弃；不会在重连后补播")
+            job.session_epoch = self._connection_epoch if session_epoch is None else session_epoch
+            if operation in ("audio", "reply_gesture"):
+                job.motion_turn = self._motion_turn
+                job.motion_revision = self._motion_revision
+                job.motion_phase = self._motion_phase
             if len(self._jobs) >= 8:
                 raise RuntimeError("StackChan request queue is full")
             self._jobs.append(job)
@@ -191,6 +348,10 @@ class StackChanFaceEvents:
                     f"StackChan {operation} exceeded {timeout:.0f}s; request cancelled."
                 )
         if job.error is not None:
+            if isinstance(job.error, ConnectionError):
+                raise ConnectionError(f"StackChan {operation}: {job.error}") from job.error
+            if isinstance(job.error, TimeoutError):
+                raise TimeoutError(f"StackChan {operation}: {job.error}") from job.error
             raise RuntimeError(f"StackChan {operation} failed: {job.error}") from job.error
         return job.result
 
@@ -257,6 +418,13 @@ class StackChanFaceEvents:
             if type(value) is not int or not low <= value <= high:
                 raise ValueError(f"{name} must be an integer in {low}..{high}")
         self.last_mic_timing = {}
+        with self._cond:
+            if not self._turn_active and not self._reply_prepared:
+                self._motion_phase = "listening"
+        if mode == "touch":
+            # Firmware may finish this quiet cue while waiting for a touch,
+            # but actual recording cancels it. VAD is always armed in stillness.
+            self._queue_state_motion("attend", "listening", cooldown=24.0)
         return self._submit(
             "microphone", timeout=(wait_ms + max_ms) / 1000.0 + 40.0,
             mode=mode, wait_ms=wait_ms, max_ms=max_ms,
@@ -279,24 +447,27 @@ class StackChanFaceEvents:
                      pcm=pcm, volume=volume)
         return True
 
-    # MOTION_LINK_V1: gestures share the existing device transaction worker.
+    # Motion, speech and sensors share the same transaction worker.
     def on_task_completed(self, result) -> None:
         from .motion_events import on_task_completed
         on_task_completed(self, result)
 
     def _execute(self, bridge: StackChanBridge, job: _DeviceJob):
+        if job.operation == "motion_event":
+            from .motion_events import execute_state_gesture
+            return execute_state_gesture(self, bridge, job)
+        if job.operation == "motion_stop":
+            from .motion_events import execute_stop_motion
+            return execute_stop_motion(self, bridge, job)
         if job.operation == "reply_gesture":
             from .motion_events import execute_reply_gesture
             return execute_reply_gesture(self, bridge, job)
-        if job.operation == "success_nod":
-            from .motion_events import execute_success_nod
-            return execute_success_nod(
-                bridge, job,
-                camera_active=getattr(self, "_motion_camera_active", False))
         # Keep camera ownership conservative after failures. v3 MOVE can close
         # the camera, so automatic gestures must never run during its session.
         if job.operation in ("camera", "identity_camera"):
             self._motion_camera_active = True
+            with self._cond:
+                self._discard_queued_motion_locked()
         result = self._execute_core(bridge, job)
         if job.operation in ("camera_close", "identity_camera", "audio", "microphone"):
             self._motion_camera_active = False
@@ -347,119 +518,187 @@ class StackChanFaceEvents:
             return True
         raise ValueError(f"Unknown StackChan operation: {job.operation}")
 
+    def _invalidate_connection(self, error) -> None:
+        with self._cond:
+            if self._connected:
+                self._connection_epoch += 1
+            self._connected = False
+            self._connection_error = str(error)
+            self._turn_active = False
+            self._motion_revision += 1
+            self._motion_phase = "idle"
+            self._pending_gesture = "none"
+            self._reply_motion_allowed = False
+            self._reply_audio_segments = self._reply_beats = 0
+            self._reply_prepared = False
+            self._reply_face = "idle"
+            self._face_hold_until = 0.0
+            self._wanted = "idle"
+            self._version += 1
+            self._motion_camera_active = False
+            while self._jobs:
+                abandoned = self._jobs.popleft()
+                abandoned.cancelled.set()
+                abandoned.error = ConnectionError("连接已切换或断开，旧设备请求已丢弃")
+                abandoned.done.set()
+            self._cond.notify_all()
+
+    def _mark_connected(self, bridge) -> None:
+        with self._cond:
+            newly_connected = not self._connected
+            self.port, self.transport = bridge.port, bridge.transport
+            self._connected = True
+            self._connection_error = ""
+            self._cond.notify_all()
+        if newly_connected:
+            label = "USB" if bridge.transport == "serial" else "Wi-Fi"
+            print(f"[StackChan] 已连接 {label}：{bridge.port}；已确认 Friston 栈酱。", flush=True)
+            capabilities = getattr(bridge, "_firmware_info", "") or ""
+            with self._cond:
+                self._gesture_faulted = False
+            if "GESTURE_V2" in capabilities:
+                print("[StackChanMotion] GESTURE_V2 已启用：丰富预设、肩上/桌面幅度、首声同步。", flush=True)
+            elif "GESTURE_V1" in capabilities:
+                print("[StackChanMotion] 当前为 GESTURE_V1：使用基础动作降级；更新固件可启用丰富预设。", flush=True)
+            else:
+                print("[StackChanMotion] 固件尚无动作预设，表情/语音照常；更新固件后启用舵机表演。", flush=True)
+
+    def _expire_jobs(self, now) -> None:
+        """Called under the condition lock, before claiming the next job."""
+        while self._jobs and (
+                self._jobs[0].cancelled.is_set() or self._jobs[0].deadline <= now
+                or self._jobs[0].session_epoch != self._connection_epoch):
+            job = self._jobs.popleft()
+            job.error = (ConnectionError("旧连接的设备请求已丢弃")
+                         if job.session_epoch != self._connection_epoch
+                         else TimeoutError("设备请求在执行前已过期"))
+            job.done.set()
+
     def _run(self) -> None:
         bridge = self._bridge
         delivered_revision = 0
-        next_connect_time = 0.0
-        last_warning = 0.0
+        next_connect_time = next_probe = last_warning = 0.0
         try:
             while True:
                 with self._cond:
                     now = time.monotonic()
-                    if self._face_hold_until and now >= self._face_hold_until:
-                        self._face_hold_until = 0.0
-                        self._reply_face = "idle"
-                        self._wanted = "idle"
-                        self._version += 1
-                    while self._jobs and (
-                        self._jobs[0].cancelled.is_set() or self._jobs[0].deadline <= now
-                        or (self._jobs[0].session_epoch is not None and
-                            self._jobs[0].session_epoch != self._connection_epoch)
-                    ):
-                        expired = self._jobs.popleft()
-                        if (expired.session_epoch is not None and
-                                expired.session_epoch != self._connection_epoch):
-                            expired.error = ConnectionError("StackChan discarded audio from an old connection")
-                        else:
-                            expired.error = TimeoutError("StackChan request expired before execution")
-                        expired.done.set()
                     if self._closed:
                         break
-                    if not self._jobs and self._version == delivered_revision:
-                        hold_left = self._face_hold_until - now if self._face_hold_until else None
-                        self._cond.wait(timeout=max(0.01, hold_left) if hold_left is not None else None)
+                    if self._face_hold_until and now >= self._face_hold_until:
+                        self._face_hold_until = 0.0
+                        self._reply_face = self._wanted = "idle"
+                        self._version += 1
+                    self._expire_jobs(now)
+                    if now < next_connect_time:
+                        self._cond.wait(timeout=min(0.25, next_connect_time - now))
                         continue
-                    delay = next_connect_time - now
-                    if delay > 0:
-                        self._cond.wait(timeout=delay)
+                    maintain = not self._connected or now >= next_probe or self._preference_dirty
+                    if not maintain and not self._jobs and self._version == delivered_revision:
+                        # A timed idle wakeup is essential: plugging USB in must
+                        # be discovered without an unrelated face/audio request.
+                        self._cond.wait(timeout=min(0.25, max(0.01, next_probe - now)))
                         continue
-                    # Claim the job BEFORE attempting a face update. If the
-                    # connection fails, report it to the waiting caller rather
-                    # than retrying a face forever and starving sensor requests.
+                    preference, preference_dirty = self._desired_preference, self._preference_dirty
+                    can_handoff = (not self._turn_active and not self._reply_prepared
+                                   and not getattr(self, "_motion_camera_active", False))
+
+                if maintain:
+                    # Discovery is separate from any user job's deadline, and
+                    # only this worker ever opens or closes a device endpoint.
+                    bridge._set_operation(self._stop_event, time.monotonic() + 10.0)
+                    try:
+                        if preference_dirty:
+                            bridge.set_preference(preference)
+                            with self._cond:
+                                if self._desired_preference == preference:
+                                    self._preference_dirty = False
+                        if can_handoff and bridge.handoff_needed():
+                            with self._cond:
+                                # on_request may arrive while USB metadata is
+                                # being enumerated. Reserve the handoff under
+                                # the same lock that begins a dialogue turn.
+                                can_handoff = (not self._turn_active and not self._reply_prepared
+                                               and not getattr(self, "_motion_camera_active", False))
+                                if can_handoff:
+                                    self._invalidate_connection("正在安全切换栈酱连接")
+                            if can_handoff:
+                                bridge.release_for_handoff()
+                                delivered_revision = 0
+                        if not bridge.is_connected:
+                            bridge.connect()
+                            self._mark_connected(bridge)
+                        elif now >= next_probe:
+                            bridge._exchange("PING", "PONG", timeout=1.0)
+                        next_probe = time.monotonic() + 1.0
+                    except Exception as error:
+                        bridge.close()
+                        self._invalidate_connection(error)
+                        delivered_revision = 0
+                        next_connect_time = time.monotonic() + 2.0
+                        if not self._stop_event.is_set() and (
+                                not last_warning or time.monotonic() - last_warning >= 15.0):
+                            LOG.warning("StackChan 等待自动连接：%s", error)
+                            last_warning = time.monotonic()
+                        continue
+                    finally:
+                        bridge._set_operation()
+
+                with self._cond:
+                    if self._closed:
+                        break
+                    self._expire_jobs(time.monotonic())
                     job = self._jobs.popleft() if self._jobs else None
                     self._active_job = job
                     revision = self._version
                     face = self._wanted if revision != delivered_revision else None
-
+                if job is None and face is None:
+                    continue
                 bridge._set_operation(
-                    job.cancelled if job is not None else self._stop_event,
-                    job.deadline if job is not None else time.monotonic() + 10.0,
+                    job.cancelled if job else self._stop_event,
+                    job.deadline if job else time.monotonic() + 5.0,
                 )
                 try:
-                    bridge.connect()
                     if face is not None:
+                        if job is not None and job.operation == "motion_event":
+                            # A decorative cue's short queue lifetime must not
+                            # shorten an otherwise healthy expression exchange.
+                            bridge._set_operation(self._stop_event, time.monotonic() + 5.0)
                         bridge.set_face(face)
                         delivered_revision = revision
                     if job is not None:
+                        if job.operation == "motion_event":
+                            bridge._set_operation(job.cancelled, job.deadline)
                         job.result = self._execute(bridge, job)
-                    next_connect_time = 0.0
-                except Exception as exc:
+                except Exception as error:
+                    old_transport = bridge.transport
                     bridge.close()
-                    delivered_revision = 0
-                    next_connect_time = time.monotonic() + 3.0
                     if job is not None:
-                        job.error = exc
-                        # Legacy AUDIO receive/playback has no CANCEL command.
-                        # ANY failed upload may leave it consuming raw bytes for
-                        # its 10s receive timeout. Early PINGs would be mistaken
-                        # for audio and refresh that timeout indefinitely.
-                        if job.operation == "audio" and bridge.transport == "serial":
-                            next_connect_time = time.monotonic() + 15.0
-                    with self._cond:
-                        # Reconnecting starts a fresh scene. A queued utterance
-                        # or physical action from before the failure must never
-                        # spring to life after the laptop rejoins the hotspot.
-                        self._connection_epoch += 1
-                        self._pending_gesture = "none"
-                        self._reply_prepared = False
-                        self._reply_face = "idle"
-                        self._face_hold_until = 0.0
-                        self._wanted = "idle"
-                        self._version += 1
-                        if bridge.transport == "tcp":
-                            self._motion_camera_active = False
-                        while self._jobs:
-                            abandoned = self._jobs.popleft()
-                            abandoned.cancelled.set()
-                            abandoned.error = ConnectionError(
-                                "StackChan connection failed; queued request discarded"
-                            )
-                            abandoned.done.set()
-                        self._cond.notify_all()
-                    if not self._stop_event.is_set() and (
-                        not last_warning or time.monotonic() - last_warning >= 15.0
-                    ):
-                        LOG.warning("StackChan unavailable (%s): %s", self.port, exc)
-                        last_warning = time.monotonic()
+                        job.error = ConnectionError(str(error))
+                    self._invalidate_connection(error)
+                    delivered_revision = 0
+                    # A broken USB AUDIO upload has no line-level CANCEL: wait
+                    # for firmware's bounded RX timeout before sending PING.
+                    delay = 15.0 if job is not None and job.operation == "audio" and old_transport == "serial" else 2.0
+                    next_connect_time = time.monotonic() + delay
+                    if not self._stop_event.is_set():
+                        LOG.warning("StackChan 本次请求已中止，将自动恢复连接：%s", error)
                 finally:
                     bridge._set_operation()
                     with self._cond:
                         self._active_job = None
                         if job is not None:
                             if job.operation in ("audio", "microphone", "identity_camera"):
-                                # Legacy firmware resets to idle after a sensor
-                                # or audio operation; restore the intended face.
                                 self._version += 1
                             job.done.set()
                         self._cond.notify_all()
         finally:
             with self._cond:
+                self._connected = False
                 while self._jobs:
                     job = self._jobs.popleft()
-                    job.error = RuntimeError("Device manager closed before execution")
+                    job.error = ConnectionError("设备管理器已关闭")
                     job.done.set()
-            # Only the owner closes its port; never open a new connection merely
-            # to reset the avatar during shutdown.
+                self._cond.notify_all()
             bridge.close()
 
     def close(self) -> None:

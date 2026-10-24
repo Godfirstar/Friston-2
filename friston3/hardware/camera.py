@@ -1,48 +1,26 @@
+"""StackChan camera on the shared automatically selected device connection."""
 from datetime import datetime
-import os
-from pathlib import Path
 
 import cv2
 
-from friston3.config import CAMERA_INDEX, CAMERA_SOURCE, PHOTOS_DIR
+from friston3.config import PHOTOS_DIR
 
 
-class RealCamera:
-    """真实摄像头适配器，负责打开、读取、保存和释放设备。"""
+class StackChanCamera:
+    """栈酱 GC0308 摄像头；USB/Wi-Fi 请求交给同一个设备工作线程。
 
-    def __init__(self, index=0, save_dir=None):
-        self.index = index
-        self.save_dir = (
-            Path(save_dir)
-            if save_dir is not None
-            else PHOTOS_DIR
-        )
-        self.cap = None
+    自动摄影/预览按需取帧，不在闲聊时后台推流。
+    实时画面固定 QVGA，普通拍照固定 VGA。
+    """
 
-    def open(self):
-        """打开摄像头；如果已经打开则复用现有连接。"""
-        if self.cap is not None and self.cap.isOpened():
-            return True
-
-        self.close()
-        self.cap = cv2.VideoCapture(self.index)
-        if not self.cap.isOpened():
-            self.close()
-            return False
-        return True
-
-    def read(self):
-        """读取一帧；摄像头未打开或读取失败时返回 None。"""
-        if self.cap is None or not self.cap.isOpened():
-            return None
-        success, frame = self.cap.read()
-        return frame if success else None
-
-    def close(self):
-        """释放摄像头资源。重复调用也是安全的。"""
-        if self.cap is not None:
-            self.cap.release()
-            self.cap = None
+    def __init__(self, device):
+        self.save_dir = PHOTOS_DIR
+        self.device = device
+        self.width = 320
+        self._session_epoch = None
+        self._opened = False
+        self._first_frame = None
+        self.last_error = ""
 
     def save_frame(self, frame):
         """将一帧图像保存为 JPG。"""
@@ -55,63 +33,6 @@ class RealCamera:
         if not cv2.imwrite(str(path), frame):
             return {"success": False, "error": "保存照片失败"}
         return {"success": True, "path": str(path)}
-
-    def snapshot_for_identity(self, *, timeout=2.5):
-        """Serial PC snapshot; native camera calls have no Python hard timeout."""
-        if not self.open():
-            raise RuntimeError("身份识别无法打开电脑摄像头")
-        try:
-            frame = None
-            for _ in range(4):
-                value = self.read()
-                if value is not None:
-                    frame = value
-            if frame is None:
-                raise RuntimeError("身份识别没有获取到电脑摄像头画面")
-            return frame
-        finally:
-            self.close()
-
-    def capture(self):
-        """执行一次普通拍照，并在结束后释放摄像头。"""
-        print("[Device] 正在拍照...")
-        if not self.open():
-            return {
-                "success": False,
-                "error": f"无法打开摄像头（设备索引：{self.index}）",
-            }
-
-        try:
-            frame = None
-            # 连续读取几帧，使用最后一帧，减少刚打开设备时的异常画面。
-            for _ in range(5):
-                image = self.read()
-                if image is not None:
-                    frame = image
-
-            if frame is None:
-                return {"success": False, "error": "读取图像失败"}
-            return self.save_frame(frame)
-        finally:
-            self.close()
-
-
-class StackChanCamera(RealCamera):
-    """栈酱 GC0308 摄像头；所有 USB 请求交给同一个设备工作线程。
-
-    自动摄影/预览按需取帧，不在闲聊时后台推流。普通拍照使用 VGA；
-    实时画面默认 QVGA，可用 FRISTON_STACKCHAN_CAMERA_WIDTH=640 提高分辨率。
-    """
-
-    def __init__(self, device, save_dir=None):
-        super().__init__(index="StackChan GC0308", save_dir=save_dir)
-        self.device = device
-        self.width = int(os.getenv("FRISTON_STACKCHAN_CAMERA_WIDTH", "320"))
-        if self.width not in (320, 640):
-            raise ValueError("FRISTON_STACKCHAN_CAMERA_WIDTH 只能设为 320 或 640")
-        self._opened = False
-        self._first_frame = None
-        self.last_error = ""
 
     def _get_frame(self, width):
         import numpy as np
@@ -136,17 +57,25 @@ class StackChanCamera(RealCamera):
         return frame
 
     def open(self):
+        if self._session_epoch != self.device.connection_epoch:
+            self._opened = False
+            self._first_frame = None
         if self._opened:
             return True
         self.last_error = ""
         if not self.device.enabled:
-            self.last_error = "栈酱摄像头需要 FRISTON_STACKCHAN_ENABLED=1"
+            self.last_error = "栈酱设备尚未就绪，正在自动连接"
             print(f"[StackChanCamera] {self.last_error}")
             return False
         try:
             # 开始时取一帧并缓存，第一轮 read 直接复用，避免重复取图。
+            epoch = self.device.connection_epoch
             self._first_frame = self._get_frame(self.width)
+            if epoch != self.device.connection_epoch:
+                self._first_frame = None
+                raise ConnectionError("取帧期间设备连接已改变，请重新开始拍照")
             self._opened = True
+            self._session_epoch = epoch
             return True
         except (OSError, RuntimeError, TimeoutError, ValueError) as error:
             self.last_error = str(error)
@@ -155,6 +84,9 @@ class StackChanCamera(RealCamera):
             return False
 
     def read(self):
+        if self._session_epoch != self.device.connection_epoch:
+            self._opened = False
+            self._first_frame = None
         if not self._opened:
             return None
         if self._first_frame is not None:
@@ -184,7 +116,7 @@ class StackChanCamera(RealCamera):
     def capture(self):
         print("[Device] 正在使用栈酱摄像头拍照（640×480）...")
         if not self.device.enabled:
-            return {"success": False, "error": "栈酱设备已禁用"}
+            return {"success": False, "error": "栈酱设备尚未就绪，正在自动连接"}
         try:
             # 一次有效 VGA 帧即可；不照搬电脑摄像头连续抓五帧的等待。
             return self.save_frame(self._get_frame(640))
@@ -197,12 +129,8 @@ class StackChanCamera(RealCamera):
             self._release_camera()
 
 
-def create_camera(device=None):
-    """main 和 preview 共用同一来源选择，避免预览仍打开电脑摄像头。"""
-    if CAMERA_SOURCE == "pc":
-        return RealCamera(index=CAMERA_INDEX)
-    if CAMERA_SOURCE == "stackchan":
-        if device is None:
-            raise ValueError("栈酱摄像头需要共享的 StackChanFaceEvents 实例")
-        return StackChanCamera(device)
-    raise ValueError("FRISTON_CAMERA_SOURCE 只能设为 stackchan 或 pc")
+def create_camera(device):
+    """Main and preview share the same StackChan connection owner."""
+    if device is None:
+        raise ValueError("栈酱摄像头需要共享的 StackChanFaceEvents 实例")
+    return StackChanCamera(device)

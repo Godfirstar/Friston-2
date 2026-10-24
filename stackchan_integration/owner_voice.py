@@ -1,4 +1,4 @@
-"""Optional local CAM++ speaker verification for the current utterance.
+"""Local CAM++ speaker verification for an enrolled owner and one utterance.
 
 The owner controller persists enrollment vectors. This module keeps audio in
 memory, returns no raw audio, and never downloads a model. A cosine score is a
@@ -9,21 +9,9 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
-import os
 import threading
 import time
 from pathlib import Path
-
-
-def _number(name, default, minimum, maximum):
-    try:
-        value = float(os.getenv(name, str(default)))
-        if not math.isfinite(value) or not minimum <= value <= maximum:
-            raise ValueError
-        return value
-    except ValueError as error:
-        raise ValueError(f"{name} 必须在 {minimum}..{maximum} 之间") from error
 
 
 class OwnerVoiceRecognizer:
@@ -37,20 +25,14 @@ class OwnerVoiceRecognizer:
 
     SAMPLE_RATE = 16000
 
-    def __init__(self, model_dir=None):
+    def __init__(self):
         root = Path(__file__).resolve().parent.parent
-        configured = str(model_dir or os.getenv("FRISTON_OWNER_VOICE_MODEL_DIR", "")).strip().strip('"')
-        self.model_dir = Path(configured).expanduser() if configured else root / "models" / "campplus"
-        if not self.model_dir.is_absolute():
-            self.model_dir = root / self.model_dir
-        self.enabled = os.getenv("FRISTON_OWNER_VOICE", "1").strip() != "0"
-        self.threshold = _number("FRISTON_OWNER_VOICE_THRESHOLD", 0.65, 0.1, 0.99)
-        self.reject_threshold = _number("FRISTON_OWNER_VOICE_REJECT_THRESHOLD", 0.45, -1.0, 0.98)
-        if self.reject_threshold >= self.threshold:
-            raise ValueError("声纹拒绝阈值必须小于匹配阈值")
-        self.min_duration = _number("FRISTON_OWNER_VOICE_MIN_SECONDS", 1.5, 1.0, 5.0)
-        self.min_active = _number("FRISTON_OWNER_VOICE_MIN_ACTIVE", 1.0, 0.5, 4.0)
-        self.num_threads = int(_number("FRISTON_OWNER_VOICE_THREADS", 2, 1, 8))
+        self.model_dir = root / "models" / "campplus"
+        self.threshold = 0.65
+        self.reject_threshold = 0.45
+        self.min_duration = 1.5
+        self.min_active = 1.0
+        self.num_threads = 2
         self._model = None
         self._np = None
         self._load_error = ""
@@ -100,9 +82,7 @@ class OwnerVoiceRecognizer:
             "reject_threshold": self.reject_threshold,
             "load_s": round(self.load_seconds, 3),
         }
-        if not self.enabled:
-            result.update(status="disabled", reason="FRISTON_OWNER_VOICE=0")
-        elif self._load_error:
+        if self._load_error:
             result.update(status="unavailable", reason=self._load_error)
         elif self._model is None:
             try:
@@ -113,8 +93,6 @@ class OwnerVoiceRecognizer:
 
     def preload(self):
         """Load a validated local checkpoint on CPU once; no hub lookup."""
-        if not self.enabled:
-            return {"status": "disabled", "reason": "声纹识别已关闭", "model_id": ""}
         with self._load_lock:
             if self._model is not None:
                 return {"status": "ok", "model_id": self._model_id}

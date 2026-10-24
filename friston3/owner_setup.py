@@ -16,7 +16,7 @@ import time
 import urllib.request
 from pathlib import Path
 
-from friston3.config import MODELS_DIR, PROJECT_ROOT, YUNET_MODEL_PATH
+from friston3.config import MODELS_DIR, YUNET_MODEL_PATH
 
 
 _SFACE_NAME = "face_recognition_sface_2021dec.onnx"
@@ -33,12 +33,6 @@ _VOICE_FILES = ("config.yaml", "configuration.json", _VOICE_WEIGHT)
 # Official funasr/campplus commit 0817bacbf3f87a85962e3b7bbe231ff3c606f404.
 _VOICE_SHA256 = "3388cf5fd3493c9ac9c69851d8e7a8badcfb4f3dc631020c4961371646d5ada8"
 _VOICE_SIZE = 28036335
-
-
-def _path(setting, default):
-    value = os.getenv(setting, "").strip().strip('"')
-    path = Path(value).expanduser() if value else default
-    return path if path.is_absolute() else PROJECT_ROOT / path
 
 
 def _missing_modules(specs):
@@ -152,7 +146,7 @@ def _voice_bundle_valid(directory):
 
 
 def _prepare_face():
-    target = _path("FRISTON_OWNER_FACE_MODEL", MODELS_DIR / _SFACE_NAME)
+    target = MODELS_DIR / _SFACE_NAME
     result = {"component": "face", "path": str(target), "success": False, "ready": False}
     missing = _missing_modules((("cv2", '"opencv-python==4.11.0.86"'),
                                 ("numpy", '"numpy==1.26.4"')))
@@ -175,7 +169,7 @@ def _prepare_face():
 
 
 def _prepare_voice():
-    target = _path("FRISTON_OWNER_VOICE_MODEL_DIR", MODELS_DIR / "campplus")
+    target = MODELS_DIR / "campplus"
     result = {"component": "voice", "path": str(target), "success": False, "ready": False}
     specs = (("funasr", '"funasr==1.4.16"'), ("yaml", "PyYAML"),
              ("numpy", '"numpy==1.26.4"'))

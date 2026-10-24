@@ -4,22 +4,24 @@ from friston3.hardware.camera import create_camera
 from friston3.vision.yunet_observer import YuNetObserver
 from friston3.vision.visualization import draw_faces
 
-from friston3.config import CAMERA_SOURCE
 from stackchan_integration import StackChanFaceEvents
 
 
 def main():
-    # 预览单独运行；不要与 main.py 或串口监视器同时占用 COM10。
-    face = StackChanFaceEvents(enabled=CAMERA_SOURCE == "stackchan")
+    # 预览单独运行，由同一个管理器自动发现连接。
+    face = StackChanFaceEvents()
     camera = None
     try:
+        print("正在自动发现栈酱，Ctrl+C 可退出。")
+        while not face.wait_ready(timeout=1.0):
+            pass
         camera = create_camera(face)
         observer = YuNetObserver()
         if not camera.open():
-            print(f"无法打开摄像头（来源：{CAMERA_SOURCE}）")
+            print("无法打开栈酱摄像头")
             return
 
-        print(f"Friston-3 视觉预览（{CAMERA_SOURCE}）")
+        print("Friston-3 栈酱视觉预览")
         print("Q: 退出 | S: 拍照 | O: 输出观测")
         while True:
             frame = camera.read()

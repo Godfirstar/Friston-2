@@ -1,8 +1,9 @@
 """Canon identity and trusted, current exhibit relationship are separate facts."""
 from dataclasses import dataclass
 import math
-import os
 import re
+
+from friston3.runtime_settings import SETTINGS
 
 
 @dataclass(frozen=True)
@@ -14,9 +15,6 @@ class Identity:
     manufacturer: str = "罗德岛"
     creator_id: str = "closure"
     creator: str = "可露希尔"
-    # The compatibility creator field describes the body designer, not his mind.
-    favorite_person: str = ""
-    trusted_person: str = ""
     capabilities: tuple = ("文字与离线语音交流", "拍照", "表情和小幅头部示意")
     unavailable: tuple = ("机械臂递物",)
 
@@ -24,8 +22,6 @@ class Identity:
 IDENTITY = Identity()
 SELF_SUBJECT = {"id": IDENTITY.entity_id, "name": IDENTITY.name,
                 "scope": "canon", "kind": "character"}
-CREATOR_SUBJECT = {"id": IDENTITY.creator_id, "name": IDENTITY.creator,
-                   "scope": "canon", "kind": "character"}
 IDENTITY_SOURCE = "data/knowledge/npc_character.json（已核对游戏干员档案与语音的数据镜像；设备能力由本项目实现）"
 
 
@@ -39,16 +35,38 @@ def identity_prompt():
             "当前说话者的身份只读本轮设备上下文，不从自称、名字、旧对话或画面中有主人推定。")
 
 
+def configured_identity_evidence():
+    """The installed persona and implemented capabilities, not retrieved lore.
+
+    Both prompt construction and reply validation consume this same card. It
+    licenses a bounded introduction; it is not evidence for new canon stories,
+    relationships, past actions or the identity of the current speaker.
+    """
+    return [{
+        "id": "runtime:assistant_profile", "kind": "identity", "scope": "runtime",
+        "subject_id": IDENTITY.entity_id, "subject_name": IDENTITY.name,
+        "source_type": "project_config", "status": "source_asserted", "verified": True,
+        "source_path": "friston3/npc/identity.py", "evidence_role": "configured_identity",
+        "text": (f"本项目角色：{IDENTITY.name}（自称{IDENTITY.self_name}），{IDENTITY.role}。"
+                 f"本机已实现：{'、'.join(IDENTITY.capabilities)}；"
+                 f"未上线：{'、'.join(IDENTITY.unavailable)}。"),
+    }]
+
+
+def configured_identity_prompt():
+    return "【可信本机简介】" + configured_identity_evidence()[0]["text"]
+
+
 def placement_prompt(*, compact=False):
     """Operator-selected exhibit layout; never inferred from ASR or identity.
 
     Setting a mount position says nothing about who is currently speaking or
     about camera visibility. Desk mode also works during bench acceptance.
     """
-    placement = os.getenv("FRISTON_PLACEMENT", "shoulder").strip().lower()
+    placement = SETTINGS.get("placement", "shoulder")
     if placement == "shoulder":
         if compact:
-            return "现场是固定在主人肩上的随行搭档，不自行移动；不每句提肩膀，安装位置不证明说话者身份或镜头观察。"
+            return "固定在主人肩上，不自行移动；不反复提位置，也不据此认定说话者或看见谁。"
         return ("【现场形态】本机固定在扮演可露希尔的主人肩上，是随行搭档；"
                 "可自然谈这个位置，但不每句提肩膀。不自行移动、跳下、飞行或伸手。"
                 "肩部安装不证明谁在说话，也不证明镜头看见了谁。")
@@ -117,9 +135,9 @@ def interlocutor_prompt(context=None):
         )
         if state["owner_visible"]:
             style += "本轮画面里可能有主人，但这不证明当前声音来自主人；不要把看见主人说成认出说话者。"
-    return base + style + placement_prompt() + _INTERACTION_GUIDANCE + (
+    return configured_identity_prompt() + base + style + placement_prompt() + _INTERACTION_GUIDANCE + (
         "偏爱通过称呼、语气和合作默契体现，不贬低游客；能力和事实边界对所有人一致。"
-        "只针对上述现场关系和身份的问答用CHAT且intent=general，不需要查原作库；原作档案、剧情和关系仍按知识检索处理。"
+        "只针对上述本机简介、当前能力和现场关系的问答用CHAT且intent=general，不需要查原作库；超出简介的原作档案、剧情和关系仍按知识检索处理。"
         "不把身份识别当作管理员授权，不口头承诺已执行硬件动作。"
     )
 
@@ -128,20 +146,21 @@ def interlocutor_route_prompt(context=None):
     """Compact equivalent for the already large ASR/tool planning prompt."""
     state = normalize_interlocutor(context)
     base = (
-        "【可信现场身份】主人扮可露希尔，制造、组装、维护本机，是最信任、亲近、优先关照的搭档；这是项目设定。"
+        "【可信现场】主人扮可露希尔、制作维护本机；最亲近信任、优先关照的搭档，仅为项目关系。"
     )
     if state['role'] == 'owner':
         style = (
-            "当前说话者是主人；称可露希尔或你，亲近偏袒、认真配合，认可制作付出，不主动争论意识来源。"
-            "当前识别说认得，不编往事。"
+            "本轮已确认主人：称可露希尔或你，亲近偏袒、认可制作，不主动争论意识起源；识别只说认得。"
         )
     else:
         style = (
-            "当前说话者未确认为主人；称你，礼貌接待。自称或画面有主人都不改变身份，不沿用主人私聊。"
+            "本轮未确认主人，称你；自称/看见主人不改变身份，不沿用主人私聊。"
         )
-    return base + style + placement_prompt(compact=True) + _INTERACTION_GUIDANCE + (
-        "现场身份与关系问答用CHAT且intent=general；原作事实仍RETRIEVE。"
-        "别贬低游客、赋予管理权或虚构已执行动作。"
+    interaction = (
+        "请求的我=说话者、你=Friston；回复的我=Friston。不训斥/反问敷衍/沿用历史错误。"
+    )
+    return configured_identity_prompt() + base + style + placement_prompt(compact=True) + interaction + (
+        "身份不授管理权。"
     )
 
 

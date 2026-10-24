@@ -1,16 +1,15 @@
 """Persistent offline synthesis and bounded audio batching for StackChan.
 
-Keeps the isolated Sherpa-ONNX TTS process alive and *coalesces adjacent PCM
-segments* up to 12 seconds before sending one audio command. This eliminates
-large transport/pre-buffering gaps in typical multi-sentence replies.
+Keeps the isolated Sherpa-ONNX TTS process alive, plays the first phrase as soon
+as it is ready, and coalesces already available later phrases up to 12 seconds.
 Uses face_events.py's single USB/TCP owner and the existing device protocol.
 """
 
 from __future__ import annotations
 
 import atexit
+import importlib.util
 import json
-import os
 import queue
 import subprocess
 import sys
@@ -21,6 +20,8 @@ from pathlib import Path
 from typing import Optional
 
 from .face_events import StackChanFaceEvents
+from friston3.runtime_settings import SETTINGS
+from friston3.runtime_bootstrap import interpreter_environment
 
 
 class AgentSpeechOutput:
@@ -28,14 +29,9 @@ class AgentSpeechOutput:
 
     def __init__(self, face: StackChanFaceEvents):
         self.face = face
-        self.enabled = os.getenv("FRISTON_TTS_AUTO", "1").lower() not in (
-            "0", "off", "false", "no"
-        )
-        try:
-            self.volume = int(os.getenv("FRISTON_TTS_VOLUME", "60"))
-        except ValueError:
-            self.volume = 60
-        self.volume = max(0, min(160, self.volume))
+        self.enabled = SETTINGS.get("speech_enabled", True)
+        self.volume = SETTINGS.get("volume", 60)
+        self._last_nonzero_volume = SETTINGS.get("last_nonzero_volume", 60)
 
         self._proc: Optional[subprocess.Popen] = None
         self._messages: queue.Queue = queue.Queue()
@@ -53,17 +49,22 @@ class AgentSpeechOutput:
 
     @staticmethod
     def _tts_python() -> Path:
-        explicit = os.getenv("FRISTON_TTS_PYTHON", "").strip().strip('"')
-        if explicit:
-            candidate = Path(explicit)
-        else:
-            candidate = Path(sys.executable).parent.parent / "friston_tts" / "python.exe"
-        if not candidate.is_file():
-            raise FileNotFoundError(
-                f"找不到 friston_tts Python: {candidate}；"
-                "可通过 FRISTON_TTS_PYTHON 指定。"
-            )
-        return candidate
+        executable = Path(sys.executable).resolve()
+        environment = executable.parent if executable.name.lower() == "python.exe" else executable.parent.parent
+        for root in (environment.parent / "friston_tts",
+                     Path(sys.base_prefix) / "envs" / "friston_tts"):
+            candidate = root / ("python.exe" if executable.name.lower() == "python.exe" else "bin/python")
+            packages = ([root / "Lib" / "site-packages"] if executable.name.lower() == "python.exe"
+                        else list((root / "lib").glob("python*/site-packages")))
+            if candidate.is_file() and any(all((path / module).is_dir()
+                    for module in ("sherpa_onnx", "numpy", "scipy")) for path in packages):
+                return candidate
+        if all(importlib.util.find_spec(module) is not None for module in ("sherpa_onnx", "numpy", "scipy")):
+            return executable
+        raise FileNotFoundError(
+            "未找到可用离线语音环境；请安装一次 friston_tts 环境及 sherpa-onnx、numpy、scipy。"
+            "程序会自动使用当前环境或相邻 Conda 语音环境。"
+        )
 
     def _launch_worker(self) -> None:
         if self._proc is not None and self._proc.poll() is None:
@@ -77,6 +78,7 @@ class AgentSpeechOutput:
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             bufsize=0,
+            env=interpreter_environment(python_exe),
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         proc = self._proc
@@ -97,6 +99,16 @@ class AgentSpeechOutput:
                         # those with protocol events, or block the producer pipe.
                         continue
                     if isinstance(obj, dict) and "event" in obj:
+                        # Timestamp arrival, not later queue consumption while
+                        # the main thread may be waiting for a clip to finish.
+                        obj["received_at"] = time.perf_counter()
+                        if obj["event"] == "ready" and proc is self._proc and not self._closed:
+                            print(
+                                f"[StackChanTTS] 预热完成：加载 {obj.get('model_load_s')}s，"
+                                f"预热 {obj.get('warmup_s', 0)}s；"
+                                "Kokoro 中英 int8，男声 58。",
+                                flush=True,
+                            )
                         messages.put(obj)
             except Exception as exc:
                 messages.put({"event": "fatal", "error": str(exc)})
@@ -111,9 +123,8 @@ class AgentSpeechOutput:
         """Speak NPC text, batching adjacent clips into <=12s PCM commands.
 
         The TTS daemon synthesizes chunks in a persistent subprocess and emits
-        PCM file events. We wait at most a small configurable prefetch window
-        after the first chunk to join adjacent clips. The whole joined buffer
-        plays as ONE speaker command, removing long mid-sentence gaps.
+        PCM file events. The first phrase plays immediately. Later clips may
+        wait for a short prefetch window to join ready neighbors.
         """
         if not self.enabled or self.volume == 0 or not self.face.enabled or self._closed:
             return False
@@ -124,6 +135,7 @@ class AgentSpeechOutput:
             print("[StackChanTTS] 回复超过 500 字，保留文字，不播音。")
             return False
 
+        start = time.perf_counter()
         with self._speech_lock:
             # A face update can discover a disconnect while the TTS worker is
             # still synthesizing. Late PCM from that reply must not become a
@@ -140,18 +152,13 @@ class AgentSpeechOutput:
                         "cmd": "speak", "id": request_id,
                         "text": reply, "output_dir": output_dir,
                     }
-                    start = time.perf_counter()
                     self._proc.stdin.write(
                         (json.dumps(msg, ensure_ascii=False) + "\n").encode("utf-8")
                     )
                     self._proc.stdin.flush()
 
                     max_pcm_bytes = 384000  # 12 seconds, mono PCM16LE/16kHz
-                    try:
-                        prefetch = float(os.getenv("FRISTON_TTS_PACK_WAIT_S", "0.25"))
-                    except ValueError:
-                        prefetch = 0.25
-                    prefetch = min(5.0, max(0.0, prefetch))
+                    prefetch = 0.08
                     segments_seen = 0
                     clips_played = 0
                     audio_secs = 0.0
@@ -163,12 +170,19 @@ class AgentSpeechOutput:
                     synth_done = False
                     expected_segments = -1
                     first_audio_s: Optional[float] = None
+                    first_segment_s: Optional[float] = None
+                    engine_wait_s = 0.0
+                    playback_cancelled = False
 
                     def flush_audio() -> None:
                         nonlocal waiting_pcm, waiting_bytes, waiting_segments
                         nonlocal first_ready_at, clips_played, audio_secs, total_hw_secs
-                        nonlocal first_audio_s
+                        nonlocal first_audio_s, playback_cancelled
                         if not waiting_pcm:
+                            return
+                        if playback_cancelled:
+                            waiting_pcm, waiting_bytes, waiting_segments = [], 0, 0
+                            first_ready_at = None
                             return
                         combined = b"".join(waiting_pcm)
                         seconds = len(combined) / 32000.0
@@ -178,8 +192,20 @@ class AgentSpeechOutput:
                             "正在传输播放..."
                         )
                         began = time.perf_counter()
-                        self.face.play_pcm(combined, volume=self.volume,
-                                           session_epoch=playback_epoch)
+                        try:
+                            self.face.play_pcm(combined, volume=self.volume,
+                                               session_epoch=playback_epoch)
+                        except (ConnectionError, TimeoutError) as error:
+                            # Keep the request directory until the producer
+                            # acknowledges completion. It checks this marker
+                            # between phrases, so no writer races directory
+                            # removal and the warmed model stays resident.
+                            playback_cancelled = True
+                            (Path(output_dir) / "cancel").touch()
+                            waiting_pcm, waiting_bytes, waiting_segments = [], 0, 0
+                            first_ready_at = None
+                            print(f"[StackChanTTS] 本轮播音已取消，模型继续驻留：{error}")
+                            return
                         elapsed = time.perf_counter() - began
                         if first_audio_s is None:
                             started_at = self.face.last_audio_timing.get("started_at")
@@ -206,8 +232,9 @@ class AgentSpeechOutput:
                                     f"TTS segment count mismatch: "
                                     f"{segments_seen} != {expected_segments}"
                                 )
+                            state = "本轮播音取消，已处理" if playback_cancelled else "完成"
                             print(
-                                f"[StackChanTTS] 完成 {segments_seen} 段合成为 "
+                                f"[StackChanTTS] {state} {segments_seen} 段合成为 "
                                 f"{clips_played} 条音频：实际音频 {audio_secs:.2f}s，"
                                 f"设备传输+播放 {total_hw_secs:.2f}s，"
                                 f"本轮总耗时 {time.perf_counter()-start:.2f}s。"
@@ -218,8 +245,11 @@ class AgentSpeechOutput:
                                 "total_s": time.perf_counter() - start,
                                 "segments": segments_seen,
                                 "clips": clips_played,
+                                "first_segment_s": first_segment_s if first_segment_s is not None else -1.0,
+                                "engine_wait_s": engine_wait_s,
+                                "cancelled": playback_cancelled,
                             }
-                            return clips_played > 0
+                            return clips_played > 0 and not playback_cancelled
 
                         if waiting_pcm and first_ready_at is not None:
                             remaining = prefetch - (time.perf_counter() - first_ready_at)
@@ -241,18 +271,17 @@ class AgentSpeechOutput:
 
                         kind = ev.get("event")
                         if kind == "ready":
-                            print(
-                                "[StackChanTTS] 模型已就绪，加载耗时 "
-                                f"{ev.get('model_load_s')}s；"
-                                f"音源={ev.get('backend', 'legacy')}，"
-                                f"音色={ev.get('speaker', 'default')}"
-                            )
-                            if ev.get("warning"):
-                                print(f"[StackChanTTS] {ev['warning']}")
+                            # The reader announces actual readiness even before
+                            # the first conversation. Do not delay it until here.
                             continue
                         if kind in ("fatal", "worker_exited"):
                             raise RuntimeError(f"TTS worker exited: {ev}")
                         if ev.get("id") != request_id:
+                            continue
+                        if kind == "started":
+                            engine_wait_s = max(0.0, float(ev["received_at"]) - start)
+                            if engine_wait_s >= 0.1:
+                                print(f"[StackChanTTS] 本轮等待引擎/队列 {engine_wait_s:.2f}s。")
                             continue
                         if kind == "error":
                             raise RuntimeError(str(ev.get("error", "TTS worker error")))
@@ -278,10 +307,15 @@ class AgentSpeechOutput:
 
                         seconds = len(raw_pcm) / 32000.0
                         segments_seen += 1
+                        ready_s = max(0.0, float(ev.get("received_at", time.perf_counter())) - start)
+                        if first_segment_s is None:
+                            first_segment_s = ready_s
                         print(
                             f"[StackChanTTS] 第 {segments_seen} 段已合成："
-                            f"音频 {seconds:.2f}s，距回复打印 "
-                            f"{time.perf_counter()-start:.2f}s。"
+                            f"音频 {seconds:.2f}s，合成 {ev.get('synth_s', '?')}s "
+                            f"（推理 {ev.get('inference_s', '?')}s，"
+                            f"音频处理 {ev.get('processing_s', '?')}s），"
+                            f"收到文本后 {ready_s:.2f}s 就绪。"
                         )
                         if waiting_pcm and waiting_bytes + len(raw_pcm) > max_pcm_bytes:
                             # A single command can play at most 12 seconds.
@@ -291,7 +325,9 @@ class AgentSpeechOutput:
                         waiting_pcm.append(raw_pcm)
                         waiting_bytes += len(raw_pcm)
                         waiting_segments += 1
-                        if waiting_bytes == max_pcm_bytes:
+                        if clips_played == 0 or waiting_bytes == max_pcm_bytes:
+                            # Never wait to pack the first phrase. The daemon
+                            # continues synthesizing while this clip plays.
                             flush_audio()
             except (OSError, ValueError, RuntimeError, TimeoutError,
                     subprocess.SubprocessError, AssertionError) as exc:
@@ -324,14 +360,26 @@ class AgentSpeechOutput:
             if proc.stdout is not None:
                 proc.stdout.close()
 
-    def set_enabled(self, enabled: bool) -> None:
-        """Local-console switch between turns; does not open another COM port."""
-        self.enabled = bool(enabled)
+    def configure_output(self, *, enabled: bool, volume: int) -> int:
+        """Commit one complete audible state before changing its in-memory copy."""
+        if type(enabled) is not bool:
+            raise ValueError("播音开关必须是布尔值")
+        if type(volume) is not int or not 0 <= volume <= 160:
+            raise ValueError("Speaker volume must be an integer in 0..160")
+        remembered = volume or self._last_nonzero_volume
+        SETTINGS.update(speech_enabled=enabled, volume=volume, last_nonzero_volume=remembered)
+        self.enabled = enabled
+        self.volume = volume
+        self._last_nonzero_volume = remembered
         if self.enabled and self.face.enabled and not self._closed:
             try:
                 self._launch_worker()
             except (OSError, ValueError, RuntimeError) as exc:
                 print(f"[StackChanTTS] 语音预热未启动：{exc}")
+        return self.volume
+
+    def unmute(self) -> int:
+        return self.configure_output(enabled=True, volume=self._last_nonzero_volume)
 
     def close(self) -> None:
         with self._speech_lock:

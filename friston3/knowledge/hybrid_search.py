@@ -57,7 +57,7 @@ def _diversified(rows, limit, ids=()):
 
 
 def hybrid_ranked_search(db, question, *, ids=(), limit=8, kinds=None, intent=None):
-    """Fuse the existing safe lexical ranking with optional embedding hits.
+    """Fuse lexical ranking and embedding hits while preserving evidence scope.
 
     `ids` MUST be the entity resolver's explicit output, including [] for no
     known person. Semantic similarity retrieves context, never creates an edge.
@@ -210,7 +210,6 @@ def main():
     parser = argparse.ArgumentParser(description='Friston-3 Hybrid RAG 手动检查入口')
     parser.add_argument('question', nargs='+')
     parser.add_argument('--top-k', type=int, default=5)
-    parser.add_argument('--mode', choices=('lexical', 'hybrid'), default='hybrid')
     args = parser.parse_args()
     question = ' '.join(args.question)
     with connect() as db:
@@ -218,14 +217,9 @@ def main():
         if resolution['status'] == 'ambiguous':
             print('人物称呼存在歧义，请使用完整名字：', resolution['ambiguities'])
             return
-        if args.mode == 'lexical':
-            rows = ranked_search(db, question, ids=resolution['entity_ids'],
-                                 limit=args.top_k,
-                                 kinds=('profile', 'character', 'event', 'project'))
-        else:
-            rows = hybrid_ranked_search(db, question, ids=resolution['entity_ids'],
-                                        limit=args.top_k,
-                                        kinds=('profile', 'character', 'event', 'project'))
+        rows = hybrid_ranked_search(db, question, ids=resolution['entity_ids'],
+                                    limit=args.top_k,
+                                    kinds=('profile', 'character', 'event', 'project'))
     for rank, row in enumerate(rows, 1):
         tags = '+'.join(row.get('retrieval_channels', ('lexical',)))
         print(f'[{rank}] RRF={row.get("fusion_score", 0):.5f} ({tags}) | '

@@ -1,6 +1,6 @@
 """Friston-3 <-> StackChan K151 USB or offline Wi-Fi TCP bridge.
 
-Negotiate ADPCM4/ACK1024 for fast uploads; retain ACK128/PCM16 compatibility.
+Use ADPCM4 for uploads and negotiate the firmware's acknowledged packet size.
 Every clip is CRC-checked by the device before playback. Sensor downloads
 use bounded, CRC-checked DATA frames on this same connection. This module
 never starts a second reader; call it through StackChanFaceEvents.
@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import argparse
 import ipaddress
-import os
 import sys
 import threading
 import time
@@ -26,6 +25,7 @@ except ImportError:
     serial = None  # TCP transport uses only the Python standard library.
 
 from .tcp_transport import TcpByteStream
+from .connection import WIFI_HOST, WIFI_PORT, preference_name, usb_candidates
 
 
 # Canonical IMA ADPCM step and index tables. Reset predictor/index each clip.
@@ -93,6 +93,10 @@ def _encode_ima_adpcm(pcm16le: bytes) -> bytes:
     return bytes(encoded)
 
 
+class StackChanCommandRejected(RuntimeError):
+    """A complete, framed GESTURE rejection; the link remains synchronized."""
+
+
 class StackChanBridge:
     """Run the same bounded device protocol over USB CDC or a local TCP link."""
 
@@ -100,45 +104,38 @@ class StackChanBridge:
         "idle", "thinking", "speaking", "happy", "neutral", "doubt",
         "sad", "angry", "sleepy", "listening", "proud", "surprised",
     })
-    VALID_GESTURES = frozenset({
+    LEGACY_GESTURES = frozenset({
         "none", "nod", "shake", "tilt", "look_left", "look_right",
+    })
+    VALID_GESTURES = LEGACY_GESTURES | frozenset({
+        "agree", "greet", "think", "proud", "chuckle", "surprised",
+        "concerned", "bow", "scan", "attend", "settle", "beat",
     })
 
     def __init__(self, port: Optional[str] = None, baudrate: int = 115200, *,
                  transport: Optional[str] = None, host: Optional[str] = None,
                  tcp_port: Optional[int] = None):
-        selected = str(transport or os.getenv("FRISTON_STACKCHAN_TRANSPORT", "serial")).strip().lower()
-        endpoint = str(port or os.getenv("FRISTON_STACKCHAN_PORT", "COM10")).strip()
+        endpoint = str(port or "").strip()
+        selected = preference_name(transport or ("usb" if endpoint else "auto"))
         if endpoint.lower().startswith("tcp://"):
             parsed = urlsplit(endpoint)
             if (not parsed.hostname or parsed.username is not None or parsed.password is not None
                     or parsed.path not in ("", "/") or parsed.query or parsed.fragment):
                 raise ValueError("Use tcp://IP:PORT without credentials, path or query")
-            if transport is not None and selected != "tcp":
-                raise ValueError("A tcp:// endpoint requires TCP transport")
+            if transport is not None and preference_name(transport) not in ("auto", "wifi"):
+                raise ValueError("A tcp:// endpoint requires Wi-Fi transport")
             host = parsed.hostname
-            tcp_port = parsed.port if parsed.port is not None else 8765
-            selected = "tcp"
-        if selected not in ("serial", "tcp"):
-            raise ValueError("FRISTON_STACKCHAN_TRANSPORT must be serial or tcp")
-        self.transport = selected
-        self.host = str(host or os.getenv("FRISTON_STACKCHAN_HOST", "192.168.4.1")).strip()
-        if selected == "tcp":
-            try:
-                self.host = str(ipaddress.ip_address(self.host))
-            except ValueError as exc:
-                raise ValueError("FRISTON_STACKCHAN_HOST must be a numeric IP, e.g. 192.168.4.1") from exc
-        try:
-            raw_tcp_port = tcp_port if tcp_port is not None else (
-                os.getenv("FRISTON_STACKCHAN_TCP_PORT", "8765") if selected == "tcp" else "8765"
-            )
-            self.tcp_port = int(raw_tcp_port)
-        except (ValueError, TypeError) as exc:
-            raise ValueError("FRISTON_STACKCHAN_TCP_PORT must be an integer") from exc
+            tcp_port = parsed.port if parsed.port is not None else WIFI_PORT
+            endpoint, selected = "", "wifi"
+        self.preference = selected
+        self._explicit_usb = endpoint or None
+        self.host = str(ipaddress.ip_address(host or WIFI_HOST))
+        self.tcp_port = WIFI_PORT if tcp_port is None else int(tcp_port)
         if not 1 <= self.tcp_port <= 65535:
-            raise ValueError("FRISTON_STACKCHAN_TCP_PORT must be in 1..65535")
-        tcp_host = f"[{self.host}]" if ":" in self.host else self.host
-        self.port = f"tcp://{tcp_host}:{self.tcp_port}" if selected == "tcp" else endpoint
+            raise ValueError("TCP port must be in 1..65535")
+        self.transport = "auto"
+        self.port = "自动发现"
+        self._usb_attempted = set()
         self.baudrate = baudrate
         self._serial = None  # serial.Serial or TcpByteStream; one reader owns it.
         self._firmware_info: Optional[str] = None
@@ -210,36 +207,129 @@ class StackChanBridge:
                 self.close()
             raise
 
+    @property
+    def is_connected(self) -> bool:
+        return self._serial is not None and self._serial.is_open and self._firmware_info is not None
+
+    def set_preference(self, value: str) -> None:
+        """Called by the device worker at a transaction boundary only."""
+        self.preference = preference_name(value)
+        self._usb_attempted.clear()
+
+    def _usb_choices(self):
+        choices = usb_candidates()
+        present = {item.identity for item in choices}
+        # An unplug followed by a later plug permits a new handshake even if
+        # Windows reuses the same COM number and the device serial number.
+        self._usb_attempted.intersection_update(present)
+        return choices
+
+    def handoff_needed(self) -> bool:
+        """No port is opened here. Never call during a binary transaction."""
+        if not self.is_connected:
+            return False
+        if self.preference == "wifi":
+            return self.transport != "tcp"
+        choices = self._usb_choices()
+        if self.transport == "serial":
+            # A disappearing enumerated USB device must not leave an apparently
+            # open stale handle until the next long sensor command times out.
+            if not self._explicit_usb and not any(item.port == self.port for item in choices):
+                raise ConnectionError("栈酱 USB 已拔出")
+            return False
+        if self.preference == "usb":
+            return True
+        return any(item.identity not in self._usb_attempted for item in choices)
+
+    def release_for_handoff(self) -> None:
+        """Release the old owner before opening the new one; no queued action retries."""
+        old_transport = self.transport
+        if self.is_connected and old_transport == "serial":
+            # Firmware rejects a new TCP owner while camera/motion is active.
+            # Stop only the current target; do not move to a fresh position.
+            self.stop_head()
+            self.close_camera()
+        self.close()
+        # Existing firmware reserves USB for 1200 ms after its last command.
+        # TCP close already invokes firmware cleanup; USB opening has its own
+        # bounded startup settling period below.
+        if old_transport == "serial":
+            deadline = time.monotonic() + 1.3
+            while time.monotonic() < deadline:
+                self._check_active()
+                time.sleep(0.05)
+
+    def _connect_endpoint(self, transport: str, endpoint: str) -> None:
+        self.transport, self.port = transport, endpoint
+        self._firmware_info = None  # Identity and capabilities belong to this endpoint.
+        if transport == "tcp":
+            self._serial = TcpByteStream(
+                self.host, self.tcp_port, timeout=0.15, write_timeout=1.0,
+                connect_timeout=1.5, check_active=self._check_active,
+            )
+        else:
+            if serial is None:
+                raise RuntimeError("USB transport requires: python -m pip install pyserial")
+            self._serial = serial.Serial(endpoint, self.baudrate, timeout=0.15, write_timeout=1.0)
+            # USB CDC may reboot on open on some board/driver combinations.
+            deadline = time.monotonic() + 1.2
+            while time.monotonic() < deadline:
+                self._check_active()
+                time.sleep(0.05)
+            self._serial.reset_input_buffer()
+        self._exchange("PING", "PONG", timeout=1.2)
+        info = self.info()
+        if "FRISTON" not in info.upper() or "STACKCHAN" not in info.upper():
+            raise ConnectionError("该端口不是 Friston 栈酱，已停止探测")
+        if "SERVO_MOTION_V1" in info:
+            # A USB CDC reopen need not reboot the board. Clear the previous
+            # owner's finite/pending sequence before this session can play
+            # new audio. STOP holds the pose; it never commands a home move.
+            self.stop_head()
+
     def connect(self) -> "StackChanBridge":
+        """Discover and verify the device; commands are never replayed here."""
         self._check_active()
-        if self._serial is not None and self._serial.is_open:
+        if self.is_connected:
             return self
-        self._firmware_info = None
-        try:
-            if self.transport == "tcp":
-                self._serial = TcpByteStream(
-                    self.host, self.tcp_port, timeout=0.15, write_timeout=1.0,
-                    connect_timeout=3.0, check_active=self._check_active,
-                )
-                # TCP opening does not reboot the ESP32. Do not drain a READY
-                # line or any valid protocol bytes as if this were USB startup.
+        choices = self._usb_choices() if self.preference != "wifi" else ()
+        candidates = []
+        if self.preference != "wifi":
+            if self._explicit_usb:
+                candidates.append(("serial", self._explicit_usb, None))
             else:
-                if serial is None:
-                    raise RuntimeError("USB transport requires: python -m pip install pyserial")
-                self._serial = serial.Serial(
-                    self.port, self.baudrate, timeout=0.15, write_timeout=1.0
-                )
-                # Some ESP32 USB CDC configurations reboot when the port opens.
-                settle_until = time.monotonic() + 1.2
-                while time.monotonic() < settle_until:
-                    self._check_active()
-                    time.sleep(0.05)
-                self._serial.reset_input_buffer()
-            self._exchange("PING", "PONG", timeout=5.0)
-            return self
-        except Exception:
-            self.close()
-            raise
+                # Try newly appeared devices first. Several unrelated ESP32
+                # ports must not repeatedly consume the whole discovery slot.
+                choices = sorted(choices, key=lambda item: item.identity in self._usb_attempted)
+                candidates.extend(("serial", item.port, item.identity) for item in choices)
+        if self.preference != "usb":
+            host = f"[{self.host}]" if ":" in self.host else self.host
+            candidates.append(("tcp", f"tcp://{host}:{self.tcp_port}", None))
+        errors = []
+        operation_deadline = self._deadline
+        for transport, endpoint, usb_id in candidates:
+            self._check_active()
+            attempt_deadline = time.monotonic() + (4.5 if transport == "serial" else 3.0)
+            if transport == "serial" and self.preference == "auto" and operation_deadline:
+                # Leave a bounded Wi-Fi attempt in every auto-discovery cycle,
+                # even when several plausible USB devices do not answer INFO.
+                usb_deadline = operation_deadline - 3.0
+                if usb_deadline - time.monotonic() < 2.5:
+                    continue
+                attempt_deadline = min(attempt_deadline, usb_deadline)
+            if usb_id is not None:
+                self._usb_attempted.add(usb_id)
+            self._deadline = min(operation_deadline, attempt_deadline) if operation_deadline else attempt_deadline
+            try:
+                self._connect_endpoint(transport, endpoint)
+                return self
+            except Exception as error:
+                self.close()
+                errors.append(f"{endpoint}: {error}")
+            finally:
+                self._deadline = operation_deadline
+        detail = "; ".join(errors[-2:]) if errors else "没有枚举到栈酱 USB"
+        raise ConnectionError("等待栈酱连接；请接 USB 数据线或让电脑连接栈酱热点。" + detail)
 
     def _read_response(self, command: str, timeout: float = 3.0) -> str:
         try:
@@ -251,6 +341,11 @@ class StackChanBridge:
                 if not line:
                     continue
                 if line.startswith("ERR "):
+                    # GESTURE has a one-line response and no binary payload.
+                    # A rejected preset must not tear down a healthy audio
+                    # link. Other command failures retain their old recovery.
+                    if command.startswith("GESTURE "):
+                        raise StackChanCommandRejected(f"StackChan rejected {command!r}: {line}")
                     raise RuntimeError(f"StackChan rejected {command!r}: {line}")
                 if (line == "PONG" or line.startswith("OK FACE ")
                         or line.startswith("OK VOLUME ") or line.startswith("OK MOVE ")
@@ -264,6 +359,8 @@ class StackChanBridge:
                 f"No response to {command!r} on {self.port}; "
                 f"check firmware, endpoint and transport ownership. Other output: {recently_seen}"
             )
+        except StackChanCommandRejected:
+            raise
         except Exception:
             if self.transport == "tcp":
                 self.close()
@@ -278,6 +375,8 @@ class StackChanBridge:
                     f"received {received!r}"
                 )
             return received
+        except StackChanCommandRejected:
+            raise
         except Exception:
             if self.transport == "tcp":
                 self.close()
@@ -300,22 +399,31 @@ class StackChanBridge:
     def set_face(self, face: str) -> None:
         if not isinstance(face, str) or face.lower() not in self.VALID_FACES:
             raise ValueError(f"Unknown face {face!r}. Choices: {sorted(self.VALID_FACES)}")
-        # New expressions degrade to an existing face on older firmware.
-        # An unflashed device must keep serving camera/audio requests.
-        fallback = {"listening": "neutral", "proud": "happy", "surprised": "doubt"}
-        name = face.lower()
-        if name in fallback and "BLOCK_FACE_V1" not in self.info():
-            name = fallback[name]
-        mode = name.upper()
+        mode = face.upper()
         self._exchange(f"FACE {mode}", f"OK FACE {mode}")
 
-    def gesture(self, name: str) -> None:
-        """Start a bounded firmware preset; ACK is not encoder verification."""
+    def gesture(self, name: str, *, placement: str = "shoulder", when: str = "now") -> None:
+        """Start/stage a finite preset; ACK is not encoder verification.
+
+        SPEECH on GESTURE_V2 starts only after AUDIO STARTED. Legacy firmware
+        accepts the original single-token command with default shoulder limits.
+        """
         if not isinstance(name, str) or name.lower() not in self.VALID_GESTURES:
-            raise ValueError(f"Unknown shoulder gesture: {name!r}")
-        self._require_capability("GESTURE_V1")
+            raise ValueError(f"Unknown head gesture: {name!r}")
+        if placement not in ("shoulder", "desk"):
+            raise ValueError("Gesture placement must be shoulder or desk")
+        if when not in ("now", "speech"):
+            raise ValueError("Gesture timing must be now or speech")
+        info = self.info()
         token = name.upper()
-        self._exchange(f"GESTURE {token}", f"OK GESTURE {token}", timeout=3.0)
+        if "GESTURE_V2" in info:
+            command = f"GESTURE {token} {placement.upper()} {when.upper()}"
+        else:
+            if ("GESTURE_V1" not in info or name.lower() not in self.LEGACY_GESTURES
+                    or placement != "shoulder" or when != "now"):
+                raise ValueError("This gesture/profile/timing requires GESTURE_V2 firmware")
+            command = f"GESTURE {token}"
+        self._exchange(command, f"OK GESTURE {token}", timeout=3.0)
 
     def move_head(self, x_tenths: int, y_tenths: int, speed: int = 300) -> None:
         """Request a StackChan head pose; angles use tenths of degrees."""
@@ -366,7 +474,7 @@ class StackChanBridge:
     def _require_capability(self, capability: str) -> None:
         if capability not in self.info():
             raise RuntimeError(
-                f"栈酱固件缺少 {capability}；请先烧录本补丁中的摄像头/麦克风固件。"
+                f"栈酱固件缺少 {capability}；请确认设备使用本项目的摄像头/麦克风固件。"
             )
 
     def _receive_blob(self, command: str, *, kind: str, dimensions: tuple[int, int],
@@ -510,28 +618,11 @@ class StackChanBridge:
         if self._serial is None or not self._serial.is_open:
             raise RuntimeError("StackChan not connected")
         info = self.info()
-        if "V4_AUDIO_PCM16_16K_ACK128" not in info:
-            raise RuntimeError(
-                "Firmware lacks the ACK128 audio capability; reported " + repr(info)
-            )
-
-        requested_codec = os.getenv("FRISTON_STACKCHAN_AUDIO_CODEC", "adpcm").strip().lower()
-        if requested_codec not in ("adpcm", "pcm"):
-            raise ValueError("FRISTON_STACKCHAN_AUDIO_CODEC must be 'adpcm' or 'pcm'")
-        use_adpcm = requested_codec == "adpcm" and "ADPCM4" in info
-        packet_bytes = 128
-        if use_adpcm:
-            wire = _encode_ima_adpcm(pcm)
-            command = "AUDIO4"
-            if "ADPCM4_ACK1024" in info:
-                command = "AUDIO4B"
-                packet_bytes = 1024
-            header = f"{command} {len(pcm)//2} {zlib.crc32(wire) & 0xFFFFFFFF:08X}\n"
-            codec_name = "ADPCM4"
-        else:
-            wire = pcm
-            header = f"AUDIO {len(pcm)} {zlib.crc32(wire) & 0xFFFFFFFF:08X}\n"
-            codec_name = "PCM16"
+        self._require_capability("ADPCM4")
+        wire = _encode_ima_adpcm(pcm)
+        command, packet_bytes = ("AUDIO4B", 1024) if "ADPCM4_ACK1024" in info else ("AUDIO4", 128)
+        header = f"{command} {len(pcm)//2} {zlib.crc32(wire) & 0xFFFFFFFF:08X}\n"
+        codec_name = "ADPCM4"
 
         started_upload = time.perf_counter()
         self._write_bytes(header.encode("ascii"))
@@ -561,15 +652,13 @@ class StackChanBridge:
             "started_at": started_playback, "playback_s": playback_seconds,
             "audio_s": clip_duration,
         }
-        if os.getenv("FRISTON_STACKCHAN_AUDIO_DIAG", "1").lower() not in (
-                "0", "no", "false", "off"):
-            print(
-                f"[StackChan:{self.transport.upper()}] codec={codec_name} ack={packet_bytes} wire={len(wire)}B "
-                f"raw={len(pcm)}B transfer={upload_seconds:.2f}s "
-                f"playback={playback_seconds:.2f}s "
-                f"audio={clip_duration:.2f}s",
-                flush=True,
-            )
+        print(
+            f"[StackChan:{self.transport.upper()}] codec={codec_name} ack={packet_bytes} wire={len(wire)}B "
+            f"raw={len(pcm)}B transfer={upload_seconds:.2f}s "
+            f"playback={playback_seconds:.2f}s "
+            f"audio={clip_duration:.2f}s",
+            flush=True,
+        )
 
     def close(self) -> None:
         self._firmware_info = None
@@ -589,12 +678,14 @@ class StackChanBridge:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Friston-3 StackChan face controller")
     parser.add_argument("--port", default=None, help="USB COM port or tcp://IP:PORT")
-    parser.add_argument("--transport", choices=("serial", "tcp"), help="Default: FRISTON_STACKCHAN_TRANSPORT or serial")
+    parser.add_argument("--transport", choices=("auto", "usb", "wifi"), help="自动发现；USB/Wi-Fi 无需环境变量")
     parser.add_argument("--host", help="Numeric device IP for offline TCP (default 192.168.4.1)")
     parser.add_argument("--tcp-port", type=int, help="Offline TCP port (default 8765)")
     parser.add_argument("--face", choices=sorted(StackChanBridge.VALID_FACES))
     parser.add_argument("--gesture", choices=sorted(StackChanBridge.VALID_GESTURES),
-                        help="Run one small shoulder gesture on GESTURE_V1 firmware")
+                        help="Run one finite head preset; extended presets require GESTURE_V2")
+    parser.add_argument("--placement", choices=("shoulder", "desk"), default="shoulder",
+                        help="Gesture amplitude profile; desk requires GESTURE_V2")
     parser.add_argument("--move", nargs=2, type=int, metavar=("X_TENTHS", "Y_TENTHS"))
     parser.add_argument("--speed", type=int, default=300)
     parser.add_argument("--home", action="store_true")
@@ -605,7 +696,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--hold", type=float, default=None,
-        help="Keep the connection open for N seconds; TCP presets default to 3 seconds",
+        help="Keep the connection open for N seconds; TCP presets default to 4 seconds",
     )
     args = parser.parse_args()
     if args.hold is not None and not 0 <= args.hold <= 300:
@@ -614,26 +705,26 @@ def main() -> None:
     try:
         transport = args.transport
         if args.port and not args.port.lower().startswith("tcp://") and transport is None:
-            transport = "serial"  # An explicit --port COM10 remains a USB command.
+            transport = "usb"
         robot = StackChanBridge(port=args.port, transport=transport, host=args.host,
                                 tcp_port=args.tcp_port)
         hold_seconds = args.hold or 0.0
-        if robot.transport == "tcp" and not args.interactive:
-            if (args.move or args.home) and not hold_seconds > 0:
-                parser.error("TCP MOVE/HOME require an explicit positive --hold (or --interactive); "
-                             "disconnecting stops motion. No command was sent.")
-            if args.gesture and args.gesture != "none" and args.hold is None:
-                hold_seconds = 3.0
-            elif args.gesture and args.gesture != "none" and hold_seconds == 0:
-                parser.error("TCP --gesture needs --hold > 0 or omit --hold for 3 seconds; "
-                             "--hold 0 would immediately stop the gesture. No command was sent.")
         with robot:
+            if robot.transport == "tcp" and not args.interactive:
+                if (args.move or args.home) and not hold_seconds > 0:
+                    parser.error("TCP MOVE/HOME require an explicit positive --hold (or --interactive); "
+                                 "disconnecting stops motion. No MOVE/HOME command was sent.")
+                if args.gesture and args.gesture != "none" and args.hold is None:
+                    hold_seconds = 4.0
+                elif args.gesture and args.gesture != "none" and hold_seconds == 0:
+                    parser.error("TCP --gesture needs --hold > 0 or omit --hold for 4 seconds; "
+                                 "--hold 0 would immediately stop the gesture. No gesture command was sent.")
             print(f"Connected: {robot.port} ({robot.info()})")
             if args.face:
                 robot.set_face(args.face)
                 print(f"Face switched to {args.face}")
             if args.gesture:
-                robot.gesture(args.gesture)
+                robot.gesture(args.gesture, placement=args.placement)
                 print(f"Gesture accepted: {args.gesture}; observe the real head to verify movement")
             if args.move:
                 robot.move_head(args.move[0], args.move[1], args.speed)

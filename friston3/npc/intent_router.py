@@ -12,7 +12,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from hashlib import sha256
 import json
-import math
 import os
 from pathlib import Path
 import tempfile
@@ -25,20 +24,6 @@ from friston3.config import PROJECT_ROOT
 LABELS = ("CHAT", "KNOWLEDGE", "LIVE", "FOLLOWUP")
 EXAMPLES_PATH = PROJECT_ROOT / "data" / "knowledge" / "intent_examples.json"
 CACHE_PATH = PROJECT_ROOT / "data" / "runtime" / "intent_semantic.npz"
-
-
-def _float_setting(name: str, default: float, low: float, high: float) -> float:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    try:
-        value = float(raw)
-        if math.isfinite(value) and low <= value <= high:
-            return value
-    except (TypeError, ValueError, OverflowError):
-        pass
-    warnings.warn(f"{name} 无效，使用默认值 {default}", RuntimeWarning, stacklevel=2)
-    return default
 
 
 @dataclass(frozen=True)
@@ -66,11 +51,9 @@ class SemanticIntentRouter:
     dialogue utterances with evidence passages. Index update is atomic.
     """
     def __init__(self):
-        self.enabled = os.getenv("FRISTON_INTENT_ROUTER", "1").strip().lower() not in (
-            "0", "false", "off", "no")
-        self.min_similarity = _float_setting("FRISTON_INTENT_SIM_MIN", 0.78, 0.0, 1.0)
-        self.min_margin = _float_setting("FRISTON_INTENT_MARGIN_MIN", 0.045, 0.0, 0.5)
-        self.min_agreement = _float_setting("FRISTON_INTENT_AGREE_MIN", 0.8, 0.5, 1.0)
+        self.min_similarity = 0.78
+        self.min_margin = 0.045
+        self.min_agreement = 0.8
         self._vectors = None
         self._labels = None
         self._model = None
@@ -99,9 +82,9 @@ class SemanticIntentRouter:
 
     def prepare(self):
         """Warm at program startup, not halfway through someone's first chat."""
-        if not self.enabled or self._vectors is not None:
+        if self._vectors is not None:
             return
-        # Defer numpy/FastEmbed imports until actually using this optional path.
+        # Share the existing retrieval encoder instead of loading another model.
         import numpy as np
         from friston3.knowledge.semantic_index import MODEL_NAME, _encoder, _unit_vectors
         examples, labels, digest = self._examples()
@@ -143,7 +126,7 @@ class SemanticIntentRouter:
 
     def classify(self, text: str) -> SemanticGuess:
         start = perf_counter()
-        if not self.enabled:
+        if self.error:
             return SemanticGuess()
         if self._vectors is None:
             self.prepare()

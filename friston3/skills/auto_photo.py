@@ -18,7 +18,7 @@ class AutoPhotoSkill:
         }
     }
 
-    def __init__(self, camera, observer=None):
+    def __init__(self, camera, observer):
         self.camera = camera
 
         self.observer = observer

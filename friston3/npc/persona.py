@@ -16,23 +16,32 @@ PRESENTATION_EMOTIONS = (
     "neutral", "warm", "amused", "proud", "thinking", "curious", "surprised",
     "concerned", "sad", "firm", "sleepy",
 )
-PRESENTATION_GESTURES = ("none", "nod", "shake", "tilt", "look_owner")
+PRESENTATION_GESTURES = (
+    "none", "auto", "nod", "agree", "shake", "tilt", "greet", "think",
+    "proud", "chuckle", "surprised", "concerned", "bow", "look_owner",
+    "look_left", "look_right", "scan",
+)
 PRESENTATION_SCHEMA = {
     "type": "object", "properties": {
         "emotion": {"type": "string", "enum": list(PRESENTATION_EMOTIONS)},
         "gesture": {"type": "string", "enum": list(PRESENTATION_GESTURES)},
     }, "required": ["emotion", "gesture"], "additionalProperties": False,
 }
+_GESTURE_PROMPT = (
+    "gesture通常auto，由设备按本句情绪编排；本轮明确不动用none，明确要求某预设就选它。"
+    "nod单点头、agree双点头、shake轻摇、tilt侧转微俯、greet招呼、think思索、"
+    "proud得意、chuckle轻笑、surprised惊讶、concerned关切、bow致意、"
+    "look_owner朝主人、look_left向左、look_right向右、scan短暂环顾。两轴不能横滚侧歪，左右按机器人视角。"
+    "一轮一个主预设，沉稳有停顿；不填角度/速度、不写动作旁白、不声称已执行。"
+)
 PRESENTATION_PROMPT = (
-    "presentation只选与本句一致的表情和可选小动作，不能代替回答或证明动作已执行。"
+    "presentation选本句表情和头部预设，不能代替回答或证明动作已执行。"
     "emotion：neutral平静、warm亲近、amused会意、proud自豪、thinking思索、curious好奇、"
     "surprised惊讶、concerned关切、sad低落、firm认真、sleepy困倦演出（不表示电量）。"
-    "gesture默认none；适合时才用nod点头、shake轻摇、tilt小幅偏头、look_owner朝主人。"
-    "一轮最多一个动作，不连续卖萌；不填角度、速度、坐标，台词不写动作旁白。"
+    + _GESTURE_PROMPT
 )
 PRESENTATION_ROUTE_PROMPT = (
-    "presentation按本句选emotion；gesture通常none，需要时才nod点头、shake轻摇、"
-    "tilt小偏头或look_owner朝主人。一轮最多一个小动作，不能声称动作已执行。"
+    "presentation按本句选emotion。" + _GESTURE_PROMPT +
     "仅CHAT选择；其他route固定neutral和none。"
 )
 

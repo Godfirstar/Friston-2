@@ -12,7 +12,6 @@ from datetime import datetime, timezone
 import json
 import math
 import os
-from pathlib import Path
 import tempfile
 import threading
 import time
@@ -21,16 +20,6 @@ from uuid import uuid4
 from friston3.config import PROJECT_ROOT
 from friston3.vision.owner_face import OwnerFaceRecognizer
 from stackchan_integration.owner_voice import OwnerVoiceRecognizer
-
-
-def _number(name, default, low, high):
-    try:
-        value = float(os.getenv(name, str(default)))
-        if not math.isfinite(value) or not low <= value <= high:
-            raise ValueError
-        return value
-    except ValueError as exc:
-        raise ValueError(f"{name} 必须在 {low}..{high} 之间") from exc
 
 
 def _empty_evidence(reason="本轮没有可用观测"):
@@ -46,12 +35,8 @@ def _cosine(left, right):
 class OwnerProfile:
     """One atomic, local JSON file containing only enrollment vectors."""
 
-    def __init__(self, path=None):
-        configured = path or os.getenv("FRISTON_OWNER_PROFILE", "")
-        self.path = Path(configured).expanduser() if configured else (
-            PROJECT_ROOT / "data" / "runtime" / "owner_identity.json")
-        if not self.path.is_absolute():
-            self.path = PROJECT_ROOT / self.path
+    def __init__(self):
+        self.path = PROJECT_ROOT / "data" / "runtime" / "owner_identity.json"
         self.data = {"version": 1, "owner_name": "可露希尔"}
         self.error = ""
         try:
@@ -139,12 +124,9 @@ class OwnerIdentityManager:
         self.camera, self.device = camera, device
         self.profile = OwnerProfile()
         self.face, self.voice = OwnerFaceRecognizer(), OwnerVoiceRecognizer()
-        self.enabled = os.getenv("FRISTON_OWNER_IDENTITY", "1").strip() != "0"
-        self.face_enabled = os.getenv("FRISTON_OWNER_FACE", "1").strip() != "0"
-        self.face_as_speaker = os.getenv("FRISTON_OWNER_FACE_AS_SPEAKER", "0").strip() == "1"
-        self.wait_budget = _number("FRISTON_OWNER_WAIT_SECONDS", 0.65, 0, 3)
-        self.camera_budget = _number("FRISTON_OWNER_CAMERA_SECONDS", 2.5, 0.5, 8)
-        self.guest_ttl = _number("FRISTON_VISITOR_IDLE_SECONDS", 45, 5, 300)
+        self.wait_budget = 0.65
+        self.camera_budget = 2.5
+        self.guest_ttl = 45
         self.mode = "auto"
         self._mode_until = 0.0
         self._owner_once = False
@@ -161,10 +143,8 @@ class OwnerIdentityManager:
 
     def warmup(self):
         """Only previously enrolled modalities are loaded; no network operations."""
-        if not self.enabled:
-            return
         for name, recognizer in (("face", self.face), ("voice", self.voice)):
-            if (name == "face" and not self.face_enabled) or not self.profile.get(name):
+            if not self.profile.get(name):
                 continue
             state = recognizer.preload()
             print(f"[身份] {name}：{state['status']} {state.get('reason', '')}")
@@ -212,7 +192,7 @@ class OwnerIdentityManager:
         ticket = _Utterance(pcm=pcm, sample_rate=sample_rate)
         self._ticket = ticket
         face_record, voice_record = self.profile.get("face"), self.profile.get("voice")
-        if not self.enabled or self.mode != "auto" or self._owner_once:
+        if self.mode != "auto" or self._owner_once:
             ticket.face_done.set()
             ticket.voice_done.set()
             return
@@ -220,27 +200,16 @@ class OwnerIdentityManager:
             self._start_probe(ticket, "voice", lambda: self.voice.observe(
                 pcm, voice_record["templates"], sample_rate, model_id=voice_record["model_id"]))
         else:
-            ticket.voice = _empty_evidence("声纹未录入、未就绪或已关闭")
+            ticket.voice = _empty_evidence("声纹未录入或未就绪")
             ticket.voice_done.set()
-        if (face_record and self.face_enabled and self.camera is not None
+        if (face_record and self.camera is not None
                 and self.face.status()["status"] == "ready"):
-            if hasattr(self.camera, "device"):
-                # StackChan owns serial I/O in one scheduler. ASR can run while
-                # this bounded atomic capture/release job is in flight.
-                self._start_probe(ticket, "face", lambda: self.face.observe(
-                    self._frame(), face_record["templates"], model_id=face_record["model_id"]))
-            else:
-                # Native VideoCapture calls cannot be cancelled by a Python
-                # timeout. Keep PC capture serial, before ASR / photo skills.
-                try:
-                    frame = self._frame()
-                    self._start_probe(ticket, "face", lambda: self.face.observe(
-                        frame, face_record["templates"], model_id=face_record["model_id"]))
-                except Exception as exc:
-                    ticket.face = {"status": "error", "reason": str(exc), "score": None}
-                    ticket.face_done.set()
+            # StackChan owns I/O in one scheduler; ASR overlaps this bounded
+            # atomic capture/release job without opening another connection.
+            self._start_probe(ticket, "face", lambda: self.face.observe(
+                self._frame(), face_record["templates"], model_id=face_record["model_id"]))
         else:
-            ticket.face = _empty_evidence("人脸未录入、未就绪或已关闭")
+            ticket.face = _empty_evidence("人脸未录入或未就绪")
             ticket.face_done.set()
 
     def new_visitor(self):
@@ -284,7 +253,7 @@ class OwnerIdentityManager:
             role, source, reason = "owner", "local_console", "主人在自己的电脑控制台输入"
         elif self.mode == "owner" or owner_once:
             role, source, reason = "owner", "local_session", "电脑端明确指定的主人演示回合"
-        elif self.enabled and pcm:
+        elif pcm:
             ticket = self._ticket
             if ticket is None or ticket.pcm is not pcm or ticket.sample_rate != sample_rate:
                 # No reuse across independently captured or rejected recordings.
@@ -301,9 +270,6 @@ class OwnerIdentityManager:
                     source = "face_voice"
             elif voice.get("status") == "mismatch":
                 role, source, reason = "visitor", "voice", "本轮声音与主人模板不匹配"
-            elif (self.face_as_speaker and face.get("status") == "match"
-                  and face.get("face_count") == 1):
-                role, source, reason = "owner", "face_assumption", "已启用单人正对镜头假设；未做唇音同步"
             elif face.get("owner_visible"):
                 reason = "看见主人，但无法确认当前声音是否来自主人"
         if role == "owner":
@@ -331,7 +297,7 @@ class OwnerIdentityManager:
 
     def status_text(self):
         self._expire_mode()
-        lines = [f"身份模式：{self.mode}；单人看脸推断说话人：{'开' if self.face_as_speaker else '关'}",
+        lines = [f"身份模式：{self.mode}；声音身份由本轮声纹确认，人脸仅提供可见性",
                  f"主人模板：{self.profile.path}"]
         if self._owner_once:
             lines.append(f"下一轮主人演示待用，{max(0, self._once_until-time.monotonic()):.0f} 秒后失效")

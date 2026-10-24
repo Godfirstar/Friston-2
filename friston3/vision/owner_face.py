@@ -5,30 +5,13 @@ Only ``extract`` returns an embedding, for an explicit enrollment operation.
 cannot establish which person produced a microphone recording.
 """
 from hashlib import sha256
-import math
-import os
-from pathlib import Path
 from threading import RLock
 from time import perf_counter
 
-from friston3.config import MODELS_DIR, PROJECT_ROOT, YUNET_MODEL_PATH
+from friston3.config import MODELS_DIR, YUNET_MODEL_PATH
 
 
 SFACE_FILENAME = "face_recognition_sface_2021dec.onnx"
-SFACE_URL = (
-    "https://media.githubusercontent.com/media/opencv/opencv_zoo/main/"
-    "models/face_recognition_sface/" + SFACE_FILENAME
-)
-
-
-def _number(name, default, lower, upper):
-    try:
-        value = float(os.getenv(name, str(default)))
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{name} 必须是数值") from exc
-    if not math.isfinite(value) or not lower <= value <= upper:
-        raise ValueError(f"{name} 必须在 {lower} 到 {upper} 之间")
-    return value
 
 
 class OwnerFaceRecognizer:
@@ -39,16 +22,13 @@ class OwnerFaceRecognizer:
     re-enrollment. Thresholds are deployment settings, not calibrated accuracy.
     """
 
-    def __init__(self, model_path=None):
-        raw_path = model_path or os.getenv("FRISTON_OWNER_FACE_MODEL", "")
-        self.model_path = Path(raw_path).expanduser() if raw_path else MODELS_DIR / SFACE_FILENAME
-        if not self.model_path.is_absolute():
-            self.model_path = PROJECT_ROOT / self.model_path
-        self.threshold = _number("FRISTON_OWNER_FACE_THRESHOLD", .50, .3, .95)
-        self.ambiguity_margin = _number("FRISTON_OWNER_FACE_MARGIN", .05, 0, .2)
-        self.min_face_size = int(_number("FRISTON_OWNER_FACE_MIN_SIZE", 64, 32, 256))
-        self.min_blur = _number("FRISTON_OWNER_FACE_MIN_SHARPNESS", 25, 0, 1000)
-        self.detector_threshold = _number("FRISTON_OWNER_FACE_DETECT_THRESHOLD", .85, .5, .99)
+    def __init__(self):
+        self.model_path = MODELS_DIR / SFACE_FILENAME
+        self.threshold = .50
+        self.ambiguity_margin = .05
+        self.min_face_size = 64
+        self.min_blur = 25
+        self.detector_threshold = .85
         self._detector = None
         self._recognizer = None
         self._cv = None
@@ -73,7 +53,7 @@ class OwnerFaceRecognizer:
         }
 
     def preload(self):
-        """Load local weights once, optionally during startup."""
+        """Load local weights once when the enrolled modality is prepared."""
         with self._lock:
             self._ensure_loaded()
             return self.status()
@@ -112,7 +92,7 @@ class OwnerFaceRecognizer:
             self._load_error = ""
             return True
         except Exception as exc:
-            # Optional recognition must not take the existing dialogue loop down.
+            # Unavailable identity evidence must not take the dialogue loop down.
             self._load_error = f"人脸识别不可用（{type(exc).__name__}）：{exc}"
             return False
 
@@ -207,7 +187,7 @@ class OwnerFaceRecognizer:
     def observe(self, frame, templates, *, model_id=None):
         """Report visible owner evidence; never persist visitor embeddings.
 
-        Scores within ``FRISTON_OWNER_FACE_MARGIN`` below the threshold remain
+        Scores within the fixed ambiguity margin below the threshold remain
         ambiguous. More than one matching face is also ambiguous. A single
         match among several faces establishes presence only; callers must use
         separate speaker evidence before choosing a personal dialogue context.

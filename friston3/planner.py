@@ -1,4 +1,4 @@
-"""Choose one registered skill and, for NPC dialogue, one evidence-access plan."""
+"""Choose one route, then bind it to the registered execution boundary."""
 from copy import deepcopy
 import json
 import math
@@ -11,6 +11,8 @@ from friston3.npc.agentic_rag import (
     build_route_input, normalize_entity_choices, parse_decision, route_schema_for_signals,
 )
 from friston3.npc.persona import normalize_presentation
+from friston3.skills.volume import VolumeControlSkill
+from friston3.skills.device_settings import DeviceSettingsSkill
 
 
 class LLMPlanner:
@@ -20,12 +22,13 @@ class LLMPlanner:
     TOOL_HELP = {
         "take_photo": "立即拍一张照片；arguments必须为{}。",
         "auto_photo": "自动构图、倒计时拍照；可选整数countdown_seconds，1至10，默认3。",
-        "npc_talk": "对话和知识问答；arguments必须为{}，同时决定所需证据和回复。",
+        "control_volume": VolumeControlSkill.description,
+        "configure_device": DeviceSettingsSkill.description,
     }
 
     def __init__(self, skill_manager, model=OLLAMA_MODEL, url=OLLAMA_CHAT_URL):
         self.model, self.url = model, url
-        self.allowed = sorted(set(self.TOOL_HELP) & set(skill_manager.skills))
+        self.allowed = sorted((set(self.TOOL_HELP) | {"npc_talk"}) & set(skill_manager.skills))
         self.last_call = {}
         self.last_input = []
 
@@ -34,23 +37,82 @@ class LLMPlanner:
         wide = sum(ord(char) >= 0x2e80 for char in text)
         return math.ceil(wide * 1.5 + (len(text) - wide) / 3)
 
+    @staticmethod
+    def _schema_for_routes(dialogue_schema, dialogue_routes, action_routes):
+        """Keep the generation contract aligned with each execution boundary.
+
+        Keep each anyOf alternative self-contained; do not mix properties
+        with anyOf or depend on conditional if/then grammar support.
+        Runtime validators remain authoritative even with constrained output.
+        """
+        def closed_object(properties, required=()):
+            return {"type": "object", "properties": properties,
+                    "required": list(required), "additionalProperties": False}
+
+        empty_arguments = closed_object({})
+        percent = {"type": "integer", "minimum": 0, "maximum": 100}
+        argument_schemas = {
+            "take_photo": empty_arguments,
+            "auto_photo": closed_object({
+                "countdown_seconds": {"type": "integer", "minimum": 1, "maximum": 10}}),
+            "control_volume": {"anyOf": [
+                closed_object({"operation": {"type": "string", "enum": ["set"]},
+                               "value": percent}, ("operation", "value")),
+                closed_object({"operation": {"type": "string", "enum": ["increase", "decrease"]},
+                               "value": percent}, ("operation",)),
+                closed_object({"operation": {"type": "string", "enum": ["mute", "unmute", "status"]}},
+                              ("operation",)),
+            ]},
+            "configure_device": {"anyOf": [
+                closed_object({"setting": {"type": "string", "enum": [setting]},
+                               **({"choice": {"type": "string", "enum": list(choices)}}
+                                  if choices else {})},
+                              ("setting", "choice") if choices else ("setting",))
+                for setting, choices in DeviceSettingsSkill.choices.items()
+            ]},
+            "UNSUPPORTED": empty_arguments,
+        }
+
+        def branch(routes, arguments, *, dialogue=False):
+            properties = {
+                "route": {"type": "string", "enum": list(routes)},
+                "arguments": deepcopy(arguments),
+                **{key: deepcopy(value) for key, value in dialogue_schema["properties"].items()
+                   if key != "route"},
+            }
+            if not dialogue:
+                properties["entity_choices"]["maxItems"] = 0
+                for key, value in (("query", ""), ("reply", ""), ("followup", False),
+                                   ("detail", False), ("intent", "general")):
+                    properties[key] = {"type": "boolean" if type(value) is bool else "string",
+                                       "enum": [value]}
+                properties["presentation"] = closed_object({
+                    "emotion": {"type": "string", "enum": ["neutral"]},
+                    "gesture": {"type": "string", "enum": ["none"]}},
+                    ("emotion", "gesture"))
+            return closed_object(properties, properties)
+
+        branches = ([branch(dialogue_routes, empty_arguments, dialogue=True)]
+                    if dialogue_routes else [])
+        branches.extend(branch((route,), argument_schemas[route])
+                        for route in [*action_routes, "UNSUPPORTED"])
+        return {"anyOf": branches}
+
     def plan(self, instruction, *, dialogue_context=None):
         self.last_call, self.last_input = {}, []
         if not isinstance(instruction, str) or not instruction.strip():
             return None
         context = dialogue_context or {}
         signals = context.get("signals", {})
-        schema = route_schema_for_signals(signals)
-        schema["properties"]["route"]["enum"].append("ACTION")
-        # A protocol-level whitelist, not a natural-language keyword router.
-        schema["properties"] = {
-            "skill": {"type": "string", "enum": self.allowed + ["none"]},
-            "arguments": {"type": "object", "properties": {
-                "countdown_seconds": {"type": "integer", "minimum": 1, "maximum": 10}},
-                "additionalProperties": False},
-            **schema["properties"],
-        }
-        schema["required"] = ["skill", "arguments", *schema["required"]]
+        dialogue_schema = route_schema_for_signals(signals)
+        dialogue_routes = (tuple(dialogue_schema["properties"]["route"]["enum"])
+                           if "npc_talk" in self.allowed else ())
+        action_routes = [name for name in self.allowed if name != "npc_talk"]
+        # A single discriminator prevents contradictory skill/route pairs.
+        # This mapping only binds an explicit model decision; it never infers
+        # a hardware action from dialogue, arguments, or a repaired draft.
+        allowed_routes = {*dialogue_routes, *action_routes, "UNSUPPORTED"}
+        schema = self._schema_for_routes(dialogue_schema, dialogue_routes, action_routes)
         started = perf_counter()
         stage = "build_input"
         self.last_call = {"phase": "unified_plan", "model": self.model,
@@ -63,9 +125,9 @@ class LLMPlanner:
                 signals=context.get("signals", {}), pending_reference=context.get("pending_reference", {}),
                 interlocutor_context=context.get("interlocutor"),
                 estimate_tokens=self._estimate_tokens,
-                tool_help={name: self.TOOL_HELP[name] for name in self.allowed})
+                tool_help={name: self.TOOL_HELP[name] for name in action_routes})
             self.last_input = messages
-            settings = AgenticSettings.from_env()
+            settings = AgenticSettings.defaults()
             self.last_call.update(
                 timeout_s=settings.route_timeout, stream=False,
                 output_token_limit=ROUTE_TOKENS,
@@ -118,42 +180,58 @@ class LLMPlanner:
             raw = result["message"]["content"]
             call = json.loads(raw, object_pairs_hook=_unique_object)
             self.last_call["parsed_plan"] = deepcopy(call)
-            expected = set(schema["required"])
-            if (not isinstance(call, dict) or set(call) - expected
-                    or expected - set(call) - {"presentation"}):
+            expected = {"arguments", *ROUTE_SCHEMA["required"]}
+            if not isinstance(call, dict) or set(call) != expected:
                 raise ValueError("planner fields do not match the schema")
-            # Performance is advisory. A missing field must not break an
-            # otherwise valid legacy plan, nor become an extra device action.
-            call["presentation"] = normalize_presentation(call.get("presentation"))
-            skill, arguments = call["skill"], call["arguments"]
-            if not isinstance(skill, str) or type(arguments) is not dict:
-                raise ValueError("invalid skill/argument types")
-            if skill not in self.allowed + ["none"]:
-                raise ValueError("skill is not registered")
-            if skill == "npc_talk":
-                if arguments:
-                    raise ValueError("npc_talk may not supply execution arguments")
+            # Presentation remains advisory and cannot grant device authority.
+            call["presentation"] = normalize_presentation(call["presentation"])
+            route, arguments = call["route"], call["arguments"]
+            if not isinstance(route, str) or type(arguments) is not dict:
+                raise ValueError("invalid route/argument types")
+            if route not in allowed_routes:
+                raise ValueError("route is not registered")
+            if route in dialogue_routes:
+                skill = "npc_talk"
+                # Older/permissive decoders can emit this lone no-op choice.
+                # Never discard actual settings/actions or rewrite the route;
+                # owner_side=none remains a real configure_device operation.
+                discarded_noop_arguments = arguments == {"choice": "none"}
+                if discarded_noop_arguments:
+                    arguments = {}
+                    call["arguments"] = arguments
+                elif arguments:
+                    raise ValueError("dialogue routes may not supply execution arguments")
                 decision = parse_decision(json.dumps({key: call[key] for key in ROUTE_SCHEMA["required"]},
                                                      ensure_ascii=False),
                                           signals=signals,
                                           pending_reference=context.get("pending_reference"),
                                           diagnostics=self.last_call)
                 decision = normalize_entity_choices(decision, signals, diagnostics=self.last_call)
+                if discarded_noop_arguments:
+                    self.last_call.setdefault("normalizations", []).append(
+                        "discarded_noop_dialogue_arguments")
+                    self.last_call["normalized_arguments"] = {}
             else:
-                if (call["route"] != "ACTION" or call["query"] != "" or call["reply"] != ""
+                skill = "none" if route == "UNSUPPORTED" else route
+                if (call["query"] != "" or call["reply"] != ""
                         or call["entity_choices"] != []
                         or call["followup"] is not False or call["intent"] != "general"
                         or call["detail"] is not False):
-                    raise ValueError("hardware action may not contain dialogue claims")
+                    raise ValueError("non-dialogue routes may not contain dialogue fields")
                 if skill == "auto_photo":
                     if set(arguments) - {"countdown_seconds"}:
                         raise ValueError("unknown auto_photo argument")
                     seconds_value = arguments.get("countdown_seconds", 3)
                     if type(seconds_value) is not int or not 1 <= seconds_value <= 10:
                         raise ValueError("countdown_seconds is out of range")
+                elif skill == "control_volume":
+                    VolumeControlSkill.validate_arguments(arguments)
+                elif skill == "configure_device":
+                    DeviceSettingsSkill.validate_arguments(arguments)
                 elif arguments:
                     raise ValueError("this skill takes no arguments")
                 decision = None
+            self.last_call["selected_skill"] = skill
             self.last_call["wall_s"] = round(perf_counter() - started, 3)
             print("[LLMPlanner] 统一决策性能：", {key: value for key, value in self.last_call.items()
                   if key not in ("raw_output", "parsed_plan", "normalized_decision")})

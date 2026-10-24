@@ -56,7 +56,7 @@ _CACHE_LOCK = RLock()
 
 
 class SpeechEntityDependencyError(ImportError):
-    """The optional pronunciation matcher cannot import its dependency."""
+    """The pronunciation matcher cannot import its required dependency."""
 
 
 @lru_cache(maxsize=1)

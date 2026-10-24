@@ -7,7 +7,7 @@ from friston3.config import YUNET_MODEL_PATH
 class YuNetObserver:
     """基于 YuNet 的人脸观测器。"""
 
-    def __init__(self, score_threshold=0.75):
+    def __init__(self):
         model_path = YUNET_MODEL_PATH
 
         if not model_path.is_file():
@@ -20,7 +20,7 @@ class YuNetObserver:
             model=str(model_path),
             config="",
             input_size=(320, 320),
-            score_threshold=score_threshold,
+            score_threshold=0.75,
             nms_threshold=0.3,
             top_k=5000
         )

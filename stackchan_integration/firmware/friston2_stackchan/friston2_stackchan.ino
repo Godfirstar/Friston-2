@@ -26,6 +26,9 @@
 // shoulder gesture. Neutral is (0,450), in tenths of a degree. No boot motion.
 // v1.1: password-protected local Wi-Fi AP, TCP 192.168.4.1:8765. The same
 // line/binary protocol works over USB or TCP, with one command owner at a time.
+// v1.2: GESTURE <TOKEN> [SHOULDER|DESK] [NOW|SPEECH] adds expressive
+// two-axis finite presets. SPEECH begins with actual playback, not upload.
+// ACK stays OK GESTURE <TOKEN>; NONE/capture/disconnect clear queued motion.
 // No Internet, external router, cloud service, or association-triggered motion.
 
 #include <Arduino.h>
@@ -244,30 +247,82 @@ bool pcmPlaying = false;
 uint32_t playbackStartAt = 0;
 uint32_t playbackDurationMs = 0;
 
-struct GestureFrame { int16_t x; int16_t y; uint16_t holdMs; };
-constexpr GestureFrame kNod[] = {{0, 490, 300}, {0, 410, 450}, {0, 450, 350}};
-constexpr GestureFrame kShake[] = {{-60, 450, 350}, {60, 450, 600}, {0, 450, 350}};
-constexpr GestureFrame kTilt[] = {{45, 430, 500}, {0, 450, 400}};
-constexpr GestureFrame kLookLeft[] = {{-80, 450, 650}, {0, 450, 500}};
-constexpr GestureFrame kLookRight[] = {{80, 450, 650}, {0, 450, 500}};
+// GESTURE_V2: offsets around the exhibit's neutral pose (0,450).
+// The BSP maps speed 0..1000 to critically damped spring parameters; it is
+// NOT degrees/second. Holds leave time for a visible pose, with gentler returns.
+// Pitch grows upward. There is no roll axis: TILT combines yaw and pitch.
+struct GestureFrame { int16_t dx; int16_t dy; uint16_t holdMs; uint16_t speed; };
+constexpr GestureFrame kNod[] = {{0,-60,600,280},{0,15,450,270},{0,0,750,220}};
+constexpr GestureFrame kAgree[] = {{0,-40,400,350},{0,20,400,340},{0,-45,450,350},{0,0,800,230}};
+constexpr GestureFrame kShake[] = {{-90,0,650,290},{90,0,750,310},{0,0,850,230}};
+constexpr GestureFrame kTilt[] = {{60,-30,950,230},{0,0,800,210}};
+constexpr GestureFrame kGreet[] = {{-30,15,450,270},{30,-55,650,280},{0,0,800,230}};
+constexpr GestureFrame kThink[] = {{60,35,1100,230},{25,10,450,230},{0,0,750,210}};
+constexpr GestureFrame kProud[] = {{0,70,900,270},{-30,40,550,250},{0,0,800,220}};
+constexpr GestureFrame kChuckle[] = {{-20,-20,380,350},{20,15,380,350},{-15,-25,400,340},{0,0,800,230}};
+constexpr GestureFrame kSurprised[] = {{0,80,550,370},{0,30,600,280},{0,0,800,220}};
+constexpr GestureFrame kConcerned[] = {{-35,-40,1000,230},{0,-20,450,230},{0,0,800,210}};
+constexpr GestureFrame kBow[] = {{0,-80,950,250},{0,-45,500,240},{0,0,850,220}};
+constexpr GestureFrame kLookLeft[] = {{-120,0,1050,260},{0,0,900,230}};
+constexpr GestureFrame kLookRight[] = {{120,0,1050,260},{0,0,900,230}};
+constexpr GestureFrame kScan[] = {{-100,15,750,260},{100,15,1000,280},{0,0,950,230}};
+constexpr GestureFrame kAttend[] = {{0,30,850,230},{0,0,750,210}};
+constexpr GestureFrame kSettle[] = {{0,0,950,220}};
+constexpr GestureFrame kBeat[] = {{0,-25,450,310},{0,0,700,230}};
+
+struct GesturePreset { const char* name; const GestureFrame* frames; size_t count; };
+#define GESTURE_PRESET(name, frames) {name, frames, sizeof(frames) / sizeof(frames[0])}
+constexpr GesturePreset kGestures[] = {
+  GESTURE_PRESET("NOD", kNod), GESTURE_PRESET("AGREE", kAgree),
+  GESTURE_PRESET("SHAKE", kShake), GESTURE_PRESET("TILT", kTilt),
+  GESTURE_PRESET("GREET", kGreet), GESTURE_PRESET("THINK", kThink),
+  GESTURE_PRESET("PROUD", kProud), GESTURE_PRESET("CHUCKLE", kChuckle),
+  GESTURE_PRESET("SURPRISED", kSurprised), GESTURE_PRESET("CONCERNED", kConcerned),
+  GESTURE_PRESET("BOW", kBow), GESTURE_PRESET("LOOK_LEFT", kLookLeft),
+  GESTURE_PRESET("LOOK_RIGHT", kLookRight), GESTURE_PRESET("SCAN", kScan),
+  GESTURE_PRESET("ATTEND", kAttend), GESTURE_PRESET("SETTLE", kSettle),
+  GESTURE_PRESET("BEAT", kBeat),
+};
+#undef GESTURE_PRESET
+
+enum class GestureProfile : uint8_t { Shoulder, Desk };
 const GestureFrame* gestureFrames = nullptr;
 size_t gestureCount = 0;
 size_t gestureIndex = 0;
 uint32_t nextGestureAt = 0;
+GestureProfile gestureProfile = GestureProfile::Shoulder;
+const GesturePreset* pendingSpeechGesture = nullptr;
+GestureProfile pendingSpeechProfile = GestureProfile::Shoulder;
+uint32_t pendingSpeechExpiresAt = 0;
+constexpr uint32_t kSpeechGestureTimeoutMs = 10000;
 
 void cancelGesture() {
-  if (gestureFrames == nullptr) return;
+  const bool movingSequence = gestureFrames != nullptr;
   gestureFrames = nullptr;
   gestureCount = gestureIndex = 0;
-  // Stop at the present pose, without sending another target toward a face,
-  // shoulder, or camera view. A subsequent explicit gesture has finite limits.
-  M5StackChan.Motion.stop();
+  pendingSpeechGesture = nullptr;
+  pendingSpeechExpiresAt = 0;
+  // Cancellation holds the current pose; it never creates a return-to-center
+  // movement near a shoulder or while a sensor is beginning capture.
+  // A final frame may still be settling in the BSP after its scheduler hold
+  // ends. Capture/cancel must stop that physical tail as well as queued frames.
+  if (movingSequence || M5StackChan.Motion.isMoving()) M5StackChan.Motion.stop();
+}
+
+int gestureCoordinate(int offset, int limit) {
+  if (gestureProfile == GestureProfile::Desk) offset = offset * 3 / 2;
+  return offset < -limit ? -limit : (offset > limit ? limit : offset);
 }
 
 void tickGesture() {
+  const uint32_t now = millis();
+  if (pendingSpeechGesture != nullptr &&
+      static_cast<int32_t>(now - pendingSpeechExpiresAt) >= 0) {
+    pendingSpeechGesture = nullptr;
+    pendingSpeechExpiresAt = 0;
+  }
   if (gestureFrames == nullptr) return;
   if (cameraOwnsBus) { cancelGesture(); return; }
-  const uint32_t now = millis();
   if (static_cast<int32_t>(now - nextGestureAt) < 0) return;
   if (gestureIndex >= gestureCount) {
     gestureFrames = nullptr;
@@ -275,34 +330,72 @@ void tickGesture() {
     return;
   }
   const GestureFrame& step = gestureFrames[gestureIndex++];
+  const bool desk = gestureProfile == GestureProfile::Desk;
+  const int x = gestureCoordinate(step.dx, desk ? 180 : 120);
+  const int y = 450 + gestureCoordinate(step.dy, desk ? 120 : 80);
+  const int speed = step.speed + (desk ? 40 : 0);
   // Preserve the v3 torque fix: establish a fresh target before enabling.
   M5StackChan.Motion.setAutoTorqueReleaseEnabled(false);
-  M5StackChan.Motion.move(step.x, step.y, 200);
+  M5StackChan.Motion.move(x, y, speed);
   M5StackChan.Motion.setTorqueEnabled(true);
   M5StackChan.Motion.setAutoTorqueReleaseEnabled(true);
   nextGestureAt = now + step.holdMs;
 }
 
-void startGesture(const char* name) {
-  cancelGesture();
-  if (strcmp(name, "NONE") == 0) {
-    protocol.println("OK GESTURE NONE");
-    return;
-  }
-  if (cameraOwnsBus) { protocol.println("ERR GESTURE_CAMERA_BUSY"); return; }
-  const GestureFrame* frames = nullptr;
-  size_t count = 0;
-  if (strcmp(name, "NOD") == 0) { frames = kNod; count = 3; }
-  else if (strcmp(name, "SHAKE") == 0) { frames = kShake; count = 3; }
-  else if (strcmp(name, "TILT") == 0) { frames = kTilt; count = 2; }
-  else if (strcmp(name, "LOOK_LEFT") == 0) { frames = kLookLeft; count = 2; }
-  else if (strcmp(name, "LOOK_RIGHT") == 0) { frames = kLookRight; count = 2; }
-  else { protocol.println("ERR UNKNOWN_GESTURE"); return; }
-  gestureFrames = frames;
-  gestureCount = count;
+void beginGesture(const GesturePreset& preset, GestureProfile profile) {
+  gestureFrames = preset.frames;
+  gestureCount = preset.count;
   gestureIndex = 0;
+  gestureProfile = profile;
   nextGestureAt = millis();
   tickGesture();
+}
+
+void startSpeechGesture() {
+  if (pendingSpeechGesture == nullptr) return;
+  const GesturePreset* preset = pendingSpeechGesture;
+  const GestureProfile profile = pendingSpeechProfile;
+  const bool expired = static_cast<int32_t>(millis() - pendingSpeechExpiresAt) >= 0;
+  cancelGesture();
+  if (!expired && !cameraOwnsBus) beginGesture(*preset, profile);
+  // No unsolicited protocol lines: AUDIO STARTED/DONE retain their old framing.
+}
+
+void startGesture(const char* args) {
+  char name[16] = {}, profileText[16] = {}, timingText[16] = {}, extra = 0;
+  const int fields = sscanf(args, "%15s %15s %15s %c", name, profileText, timingText, &extra);
+  if (fields < 1 || fields > 3) { protocol.println("ERR GESTURE_HEADER"); return; }
+  GestureProfile profile = GestureProfile::Shoulder;
+  bool onSpeech = false;
+  if (fields >= 2) {
+    if (strcmp(profileText, "DESK") == 0) profile = GestureProfile::Desk;
+    else if (strcmp(profileText, "SHOULDER") == 0) {}
+    else if (fields == 2 && strcmp(profileText, "NOW") == 0) {}
+    else if (fields == 2 && strcmp(profileText, "SPEECH") == 0) onSpeech = true;
+    else { protocol.println("ERR GESTURE_PROFILE"); return; }
+  }
+  if (fields == 3) {
+    if (strcmp(timingText, "SPEECH") == 0) onSpeech = true;
+    else if (strcmp(timingText, "NOW") != 0) { protocol.println("ERR GESTURE_TIMING"); return; }
+  }
+  const bool none = strcmp(name, "NONE") == 0;
+  const GesturePreset* preset = nullptr;
+  for (const auto& entry : kGestures) {
+    if (strcmp(name, entry.name) == 0) { preset = &entry; break; }
+  }
+  if (!none && preset == nullptr) { protocol.println("ERR UNKNOWN_GESTURE"); return; }
+  if (!none && cameraOwnsBus) { protocol.println("ERR GESTURE_CAMERA_BUSY"); return; }
+  // Validate every field before touching the current action or pending speech.
+  cancelGesture();
+  if (!none) {
+    if (onSpeech) {
+      pendingSpeechGesture = preset;
+      pendingSpeechProfile = profile;
+      pendingSpeechExpiresAt = millis() + kSpeechGestureTimeoutMs;
+    } else {
+      beginGesture(*preset, profile);
+    }
+  }
   protocol.print("OK GESTURE ");
   protocol.println(name);
 }
@@ -391,6 +484,7 @@ void serviceTransport(bool allowClaim) {
   const bool usbQuiet = millis() - lastUsbActivityAt >= kUsbClaimQuietMs;
   const bool busy = !allowClaim || tcpOwner || commandActive || pcmReceiving ||
                     pcmPlaying || cameraOwnsBus || gestureFrames != nullptr ||
+                    pendingSpeechGesture != nullptr ||
                     lineUsed != 0 || lineTooLong || Serial.available() != 0 || !usbQuiet;
   if (busy) {
     static const char response[] = "ERR TRANSPORT_BUSY\n";
@@ -883,6 +977,7 @@ void captureMic(const char* args) {
       tickGesture();
       drawBlockFace();
       if (micCancelRequested(control)) {
+        cancelGesture();
         protocol.println("MIC CANCELLED");
         return;
       }
@@ -1149,6 +1244,7 @@ void startPlayback() {
   playbackDurationMs = static_cast<uint32_t>((sampleCount * 1000ULL) / kSampleRate);
   lastLipAt = 0;
   protocol.println("AUDIO STARTED");
+  startSpeechGesture();
 }
 
 // Standard IMA ADPCM 4-bit nibble decoder. Reset state for each clip.
@@ -1299,8 +1395,8 @@ void handleLine(const char* line) {
   }
   if (strcmp(line, "INFO") == 0) {
     protocol.print((fastAudioReady || tcpOwner)
-        ? "INFO FRISTON2_STACKCHAN_V4_AUDIO_PCM16_16K_ACK128_ADPCM4_ACK1024 CAMERA_JPEG_V1 MIC_PCM16_V1 SERVO_MOTION_V1 SERVO_TORQUE_FIX_V3 BLOCK_FACE_V1 FACE_AUDIO_HOLD_V1 GESTURE_V1"
-        : "INFO FRISTON2_STACKCHAN_V4_AUDIO_PCM16_16K_ACK128_ADPCM4 CAMERA_JPEG_V1 MIC_PCM16_V1 SERVO_MOTION_V1 SERVO_TORQUE_FIX_V3 BLOCK_FACE_V1 FACE_AUDIO_HOLD_V1 GESTURE_V1");
+        ? "INFO FRISTON2_STACKCHAN_V4_AUDIO_PCM16_16K_ACK128_ADPCM4_ACK1024 CAMERA_JPEG_V1 MIC_PCM16_V1 SERVO_MOTION_V1 SERVO_TORQUE_FIX_V3 BLOCK_FACE_V1 FACE_AUDIO_HOLD_V1 GESTURE_V1 GESTURE_V2"
+        : "INFO FRISTON2_STACKCHAN_V4_AUDIO_PCM16_16K_ACK128_ADPCM4 CAMERA_JPEG_V1 MIC_PCM16_V1 SERVO_MOTION_V1 SERVO_TORQUE_FIX_V3 BLOCK_FACE_V1 FACE_AUDIO_HOLD_V1 GESTURE_V1 GESTURE_V2");
     if (wifiReady) protocol.print(" WIFI_TCP_V1");
     protocol.println();
     return;
@@ -1374,6 +1470,7 @@ void handleLine(const char* line) {
     return;
   }
   if (strcmp(line, "CAMERA CLOSE") == 0) {
+    cancelGesture();
     protocol.println(closeCamera() ? "OK CAMERA CLOSE" : "ERR I2C_RESTORE");
     return;
   }

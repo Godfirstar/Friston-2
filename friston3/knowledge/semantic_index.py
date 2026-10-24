@@ -5,6 +5,7 @@
     python -m friston3.knowledge.semantic_index search "为什么凯尔希那么执着" --top-k 5
 
 索引从已构建的 terra_lore.db 读取，不修改原知识库和人物关系。
+build 是显式初始化操作，缺失时下载唯一的 BGE 模型；正常对话仅使用本地缓存。
 仅索引非关系性文本；检索命中本身不证明人物交情或剧情事实。
 """
 from __future__ import annotations
@@ -44,14 +45,25 @@ def _connect(db_file: Path):
     return db
 
 
-@lru_cache(maxsize=1)
-def _encoder():
-    # 延迟加载：未执行 build/search 时，不占用模型资源。
+def _embedding_class():
+    # 延迟导入：未使用语义能力时，不占用模型资源。
     try:
         from fastembed import TextEmbedding
     except ImportError as exc:
         raise RuntimeError("未安装 FastEmbed，请运行 python -m pip install fastembed") from exc
-    return TextEmbedding(model_name=MODEL_NAME, threads=2)
+    return TextEmbedding
+
+
+@lru_cache(maxsize=1)
+def _encoder():
+    # 对话、意图路由共用这一实例；缺模型不触发联网或改用另一套模型。
+    try:
+        return _embedding_class()(model_name=MODEL_NAME, threads=2, local_files_only=True)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise RuntimeError(
+            "本地 BGE 语义模型不可用；请运行 python -m friston3.knowledge.semantic_index build "
+            f"准备模型和索引。原因为：{exc}"
+        ) from exc
 
 
 def _unit_vectors(vectors: np.ndarray) -> np.ndarray:
@@ -74,7 +86,8 @@ def build(db_file: Path = KNOWLEDGE_DB, index_path: Path = INDEX_PATH):
     if not rows:
         raise RuntimeError("没有可索引的文本，请先检查 terra_lore.db 的 passages 表。")
 
-    model = _encoder()
+    # Only this explicit preparation command may fill the same model cache.
+    model = _embedding_class()(model_name=MODEL_NAME, threads=2, local_files_only=False)
     passage_ids = np.asarray([row["id"] for row in rows], dtype=np.int64)
     batches = []
     print(f"开始为 {len(rows)} 条非关系性文本建立中文向量索引……", flush=True)
@@ -177,7 +190,7 @@ def search(question: str, top_k: int = 5, db_file: Path = KNOWLEDGE_DB,
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Friston-3 中文语义索引（独立验收）")
+    parser = argparse.ArgumentParser(description="Friston-3 中文语义索引构建与查询")
     parser.add_argument("operation", choices=("build", "search"))
     parser.add_argument("question", nargs="*")
     parser.add_argument("--top-k", type=int, default=5)

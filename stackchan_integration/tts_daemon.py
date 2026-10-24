@@ -2,7 +2,7 @@
 
 Launched once in the existing friston_tts environment by voice_output.py.
 Receives JSONL requests over stdin and streams SEGMENT events over stdout.
-Only generates PCM files; never opens COM10 or loads the robot Agent.
+Only generates PCM files; never opens a device connection or loads the Agent.
 
 This is a runtime worker, NOT a test script.
 """
@@ -10,12 +10,11 @@ This is a runtime worker, NOT a test script.
 from __future__ import annotations
 
 import json
-import os
 import sys
 import time
 from pathlib import Path
 
-from .local_tts import OfflineChineseVoice
+from .local_tts import OfflineCharacterVoice
 from .tts_export import split_text, synthesize_part
 
 
@@ -27,13 +26,15 @@ def emit(obj: dict) -> None:
 def serve() -> None:
     start = time.perf_counter()
     try:
-        voice = OfflineChineseVoice()
+        voice = OfflineCharacterVoice()
+        model_load_s = time.perf_counter() - start
+        warmup_s = voice.warmup()
     except Exception as exc:
         emit({"event": "fatal", "error": f"{type(exc).__name__}: {exc}"})
         return
-    emit({"event": "ready", "model_load_s": round(time.perf_counter() - start, 3),
-          "backend": voice.backend, "speaker": voice.speaker, "style": voice.style,
-          "bilingual": voice.bilingual, "warning": voice.warning})
+    emit({"event": "ready", "model_load_s": round(model_load_s, 3),
+          "warmup_s": round(warmup_s, 3), "warmed_up": True,
+          "backend": voice.backend, "speaker": voice.speaker, "style": voice.style})
 
     for raw in sys.stdin.buffer:
         if not raw.strip():
@@ -48,25 +49,33 @@ def serve() -> None:
                 continue
 
             request_id = int(request["id"])
+            request_started = time.perf_counter()
+            emit({"event": "started", "id": request_id})
             source = request["text"]
             if not isinstance(source, str) or not 0 < len(source.strip()) <= 500:
                 raise ValueError("Reply must contain between 1 and 500 characters")
             out_dir = Path(request["output_dir"])
             out_dir.mkdir(parents=True, exist_ok=True)
-            segment_chars = max(25, min(72, int(os.getenv("FRISTON_TTS_SEGMENT_CHARS", "48"))))
             # Normalize names using the full language context before chunking.
             source = voice.prepare_text(source)
-            parts = split_text(source, limit=segment_chars)
+            parts = split_text(source, limit=32, first_limit=20)
             if not parts:
                 raise ValueError("No text after normalization")
 
             total = 0
             synthesized_s = 0.0
+            cancelled = False
             for part in parts:
+                if (out_dir / "cancel").exists():
+                    cancelled = True
+                    break
                 started = time.perf_counter()
                 segments = synthesize_part(voice, part)
                 duration = time.perf_counter() - started
                 synthesized_s += duration
+                if (out_dir / "cancel").exists():
+                    cancelled = True
+                    break
                 for chunk in segments:
                     if not chunk or len(chunk) % 2 or len(chunk) > 384000:
                         raise ValueError("Unexpected PCM buffer size")
@@ -79,11 +88,15 @@ def serve() -> None:
                         "bytes": len(chunk),
                         "path": str(filename),
                         "synth_s": round(duration, 3),
+                        "inference_s": round(voice.last_synthesis_timing.get("inference_s", 0.0), 3),
+                        "processing_s": round(voice.last_synthesis_timing.get("processing_s", 0.0), 3),
+                        "request_elapsed_s": round(time.perf_counter() - request_started, 3),
                     })
                     total += 1
             emit({
                 "event": "done", "id": request_id, "segments": total,
                 "synth_total_s": round(synthesized_s, 3),
+                "cancelled": cancelled,
             })
         except Exception as exc:
             # Keep engine loaded if the current request fails.

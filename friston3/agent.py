@@ -28,14 +28,10 @@ class Agent:
             # Explicit command syntax remains a protocol, not intent inference.
             if is_memory_command(instruction):
                 call = {"skill": "npc_talk", "arguments": {}}
-            elif (getattr(self.planner, "supports_dialogue_context", False)
-                  and callable(getattr(npc, "prepare_route_context", None))
-                  and getattr(getattr(npc, "agentic", None), "enabled", False)):
+            else:
                 context = npc.prepare_route_context(instruction, input_source=input_source)
                 context["input_text"] = deepcopy(input_text)
                 call = self.planner.plan(instruction, dialogue_context=context)
-            else:
-                call = self.planner.plan(instruction)
             if call is None:
                 planner_call = deepcopy(getattr(self.planner, "last_call", {}))
                 error = planner_call.get("status") == "error"
